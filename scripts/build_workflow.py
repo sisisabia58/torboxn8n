@@ -43,11 +43,14 @@ SHEET_COLUMNS = ("timestamp", "telegram_user", "source_link", "folder_name",
 
 # Poll ceilings. Without these a loop runs until n8n's execution timeout, which
 # looks identical to "still working" from the outside.
-MAX_DOWNLOAD_POLLS = 120   # x30s = 1 hour
+# With adaptive intervals (30s x6, 60s x24, then 120s) 120 polls covers ~3.4
+# hours -- far more than the flat 30s it replaces, for the same poll count.
+MAX_DOWNLOAD_POLLS = 120
 # Raised from 180 (1h) to cover legitimately large transfers. A premature cap
 # destroys a working multi-hour transfer; a generous one only wastes wall clock
 # on a genuinely stuck run, which the guard still catches.
-MAX_JOB_POLLS = 540        # x20s = 3 hours
+# Adaptive (20s x6, 60s x24, then 120s): 200 polls covers ~6 hours.
+MAX_JOB_POLLS = 200
 
 
 def sheet_schema():
@@ -64,10 +67,12 @@ def sheet_schema():
 # Retuned batching (25 per batch, 2s pause) runs at ~238/min, so 1000 files is
 # roughly 4 minutes of queueing.
 #
-# Zip is kept only as a safety valve for absurd folders. It has never executed
-# once (see docs/v2-roadmap.md 2.3), so raising this threshold makes an
-# unexercised path LESS likely to fire, which is the safer direction.
-FILE_COUNT_THRESHOLD = 1000
+# Raised to 5000 so a 1600-file folder stays on the per-file path. Zipping it
+# would only move work into n8n: the zip must then be downloaded, extracted and
+# re-uploaded file by file, so ~200 GB crosses the container to save TorBox API
+# calls that were never the constraint. Zip is a safety valve for absurd folders,
+# and it has still never executed once (docs/v2-roadmap.md 2.3).
+FILE_COUNT_THRESHOLD = 5000
 
 # Credentials required, by n8n credential type -> credential NAME on the instance.
 # torBoxApi is intentionally absent: the workflow no longer uses the community
@@ -390,8 +395,14 @@ def build(creds):
             "additionalFields": {},
         }, tg, {"onError": "continueRegularOutput"}),
 
+        # Adaptive: tight early so short downloads feel responsive, then backing
+        # off so a long one does not accumulate hundreds of retained polls.
+        # Each poll retains the whole response (~0.77 KB per file), so interval
+        # length is the direct lever on memory.
         node("Wait 30s", "n8n-nodes-base.wait", 1.1, [660, 380],
-             {"resume": "timeInterval", "amount": 30, "unit": "seconds"},
+             {"resume": "timeInterval",
+              "amount": "={{ $runIndex < 6 ? 30 : ($runIndex < 30 ? 60 : 120) }}",
+              "unit": "seconds"},
              None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000001"}),
 
         # --- Task 5: mint a real Google access token -------------------------
@@ -596,7 +607,9 @@ def build(creds):
         }, tg, {"onError": "continueRegularOutput"}),
 
         node("Wait Jobs 20s", "n8n-nodes-base.wait", 1.1, [2200, 400],
-             {"resume": "timeInterval", "amount": 20, "unit": "seconds"},
+             {"resume": "timeInterval",
+              "amount": "={{ $runIndex < 6 ? 20 : ($runIndex < 30 ? 60 : 120) }}",
+              "unit": "seconds"},
              None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000003"}),
 
         # Fills the silent window between "uploads finished" and "files filed".
