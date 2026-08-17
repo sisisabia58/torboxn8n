@@ -185,6 +185,72 @@ def drive_http(name, pos, method, url_expr, body_expr=None):
                        "maxTries": 4, "waitBetweenTries": 5000})
 
 
+POLL_WORKFLOW_NAME = "TorBox Job Poll"
+
+
+def build_poll_subworkflow(creds):
+    """A single job poll, isolated from the parent execution.
+
+    Polling retains its whole response on every iteration, and that response
+    scales with file count (~0.64 KB per job). At 1600 files over an hour that
+    is ~200 MB in the parent alone -- execution 5 died at 150 MB.
+
+    Running one poll per sub-execution keeps the large payload inside a
+    throwaway execution and returns ~100 bytes to the parent, so parent
+    retention stops scaling with poll count.
+    """
+    return {
+        "name": POLL_WORKFLOW_NAME,
+        "nodes": [
+            node("Input", "n8n-nodes-base.executeWorkflowTrigger", 1.1, [0, 0],
+                 {"inputSource": "passthrough"}),
+
+            node("Fetch Jobs", "n8n-nodes-base.httpRequest", 4.2, [220, 0], {
+                "method": "GET",
+                "url": "={{ '" + TORBOX_API + "/integration/jobs/' + $json.hash }}",
+                "authentication": "genericCredentialType",
+                "genericAuthType": "httpHeaderAuth",
+                "sendHeaders": True,
+                "specifyHeaders": "keypair",
+                "headerParameters": {"parameters": [
+                    {"name": "User-Agent", "value": UA}]},
+                "options": {},
+            }, {"httpHeaderAuth": creds["httpHeaderAuth"]},
+               {"retryOnFail": True, "maxTries": 3, "waitBetweenTries": 5000}),
+
+            node("Verdict", "n8n-nodes-base.code", 2, [440, 0], {
+                "mode": "runOnceForAllItems",
+                "language": "javaScript",
+                "jsCode":
+                    "// Return counts only. The full job list must NOT cross back\n"
+                    "// into the parent -- that is the whole point of this split.\n"
+                    "const want = new Set($('Input').first().json.job_ids);\n"
+                    "const all = $input.first().json.data || [];\n"
+                    "const mine = all.filter(j => want.has(j.id));\n"
+                    "\n"
+                    "const completed = mine.filter(j => j.status === 'completed').length;\n"
+                    "const failed = mine.filter(j => j.status === 'failed').length;\n"
+                    "const progress = mine.length\n"
+                    "  ? mine.reduce((a, j) => a + (j.progress || 0), 0) / mine.length : 0;\n"
+                    "\n"
+                    "return [{ json: {\n"
+                    "  seen: mine.length,\n"
+                    "  expected: want.size,\n"
+                    "  completed,\n"
+                    "  failed,\n"
+                    "  progress,\n"
+                    "  done: mine.length > 0 && (completed + failed) === mine.length,\n"
+                    "} }];",
+            }),
+        ],
+        "connections": {
+            "Input": {"main": [[{"node": "Fetch Jobs", "type": "main", "index": 0}]]},
+            "Fetch Jobs": {"main": [[{"node": "Verdict", "type": "main", "index": 0}]]},
+        },
+        "settings": {"executionOrder": "v1"},
+    }
+
+
 def node(name, ntype, tv, pos, params, creds=None, extra=None):
     n = {
         "parameters": params,
@@ -201,7 +267,7 @@ def node(name, ntype, tv, pos, params, creds=None, extra=None):
     return n
 
 
-def build(creds):
+def build(creds, poll_wf_id=None):
     """Tasks 2-4: Telegram intake, link validation, download creation, poll loop."""
     tg = {"telegramApi": creds["telegramApi"]}
     chat_id = "={{ $('Telegram Trigger').item.json.message.chat.id }}"
@@ -524,50 +590,49 @@ def build(creds):
                 "if (!ids.length) {\n"
                 "  throw new Error('No job ids captured from the queue step');\n"
                 "}\n"
-                "return [{ json: { job_ids: ids, queued: ids.length } }];",
+                "return [{ json: { job_ids: ids, queued: ids.length,\n"
+                "  hash: $('Create Download').first().json.data.hash } }];",
         }),
 
-        # One call returns every job for the hash, so polling cost is constant
-        # whether the folder held 4 files or 400.
-        node("Check Jobs", "n8n-nodes-base.httpRequest", 4.2, [2200, 160], {
-            "method": "GET",
-            "url": "={{ '" + TORBOX_API + "/integration/jobs/' + "
-                   "$('Create Download').item.json.data.hash }}",
-            "authentication": "genericCredentialType",
-            "genericAuthType": "httpHeaderAuth",
-            "sendHeaders": True,
-            "specifyHeaders": "keypair",
-            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
-            "options": {},
-        }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
+        # Rebuilt each iteration so the sub-workflow always receives the ids.
+        # This node is the only one in the loop carrying the id list.
+        node("Prep Poll", "n8n-nodes-base.code", 2, [2200, 160], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "const p = $('Poll Once').first().json;\n"
+                "return [{ json: { hash: p.hash, job_ids: p.job_ids } }];",
+        }),
+
+        # One poll, run as a separate execution. The full job list stays inside
+        # that sub-execution; only a ~100 byte verdict comes back, so parent
+        # retention no longer scales with poll count.
+        node("Check Jobs", "n8n-nodes-base.executeWorkflow", 1, [2310, 160], {
+            "source": "database",
+            "workflowId": poll_wf_id or "",
+            "mode": "once",
+            "options": {"waitForSubWorkflow": True},
+        }),
 
         # GET /integration/jobs/{hash} returns every job ever created for that
         # hash, including those from previous runs of the same link. Without
         # this filter a second run sees 144 jobs for a 72-file folder, doubles
         # the Drive fix-up work, and reports inflated counts. Filtering by
         # created_at also covers the zip branch, which produces a single job.
-        node("This Run's Jobs", "n8n-nodes-base.code", 2, [2310, 160], {
-            "mode": "runOnceForAllItems",
-            "language": "javaScript",
-            "jsCode":
-                "// Exact by construction: these are the ids the queue step returned\n"
-                "// this run. The previous filter used created_at >= the Telegram\n"
-                "// message time, which ALSO matched a later concurrent run of the\n"
-                "// same link -- same hash, earlier cutoff -- so an overlapping run\n"
-                "// would wait on the other run's jobs and try to file its files.\n"
-                "const want = new Set($('Poll Once').first().json.job_ids);\n"
-                "const all = $input.first().json.data || [];\n"
-                "const mine = all.filter(j => want.has(j.id));\n"
-                "\n"
-                "// A job can take a moment to appear in the list. Throwing here\n"
-                "// routes to the failure path rather than silently proceeding with\n"
-                "// an empty set, which is how the files[] race hid once already.\n"
-                "if (!mine.length) {\n"
-                "  throw new Error('None of this run\\u2019s ' + want.size\n"
-                "    + ' job ids appear in the job list yet');\n"
-                "}\n"
-                "return [{ json: { data: mine, expected: want.size } }];",
-        }, None, {"onError": "continueErrorOutput"}),
+        # Fetched ONCE, after the loop says done, purely to get file_names for
+        # filing. One large payload instead of one per poll.
+        node("Fetch Final Jobs", "n8n-nodes-base.httpRequest", 4.2, [2640, 160], {
+            "method": "GET",
+            "url": "={{ '" + TORBOX_API + "/integration/jobs/' + "
+                   "$('Poll Once').first().json.hash }}",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "options": {},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]},
+           {"retryOnFail": True, "maxTries": 3, "waitBetweenTries": 5000}),
 
         node("All Jobs Done?", "n8n-nodes-base.if", 2.2, [2420, 160], {
             "conditions": {
@@ -576,8 +641,7 @@ def build(creds):
                             "typeValidation": "strict", "version": 2},
                 "conditions": [{
                     "id": "jobs-terminal",
-                    "leftValue": "={{ $json.data.every(j => j.status === 'completed'"
-                                 " || j.status === 'failed') }}",
+                    "leftValue": "={{ $json.done }}",
                     "rightValue": "",
                     "operator": {"type": "boolean", "operation": "true",
                                  "singleValue": True},
@@ -641,13 +705,14 @@ def build(creds):
                 "// flattened names TorBox produces. Anything deeper than two\n"
                 "// levels collapses into its level-2 section, by design.\n"
                 "//\n"
-                "// Read the job list from its node by name, NOT from $input:\n"
-                "// the immediately upstream node is a Telegram edit, whose\n"
-                "// output is the Telegram API response, not the jobs payload.\n"
-                "const src = $(\"This Run's Jobs\").first().json.data;\n"
-                "if (!Array.isArray(src)) {\n"
-                "  throw new Error('Expected a jobs array from This Run\\u2019s Jobs, got '\n"
-                "    + JSON.stringify(src).slice(0, 120));\n"
+                "// Read from the one-time full fetch, filtered to this run's job\n"
+                "// ids. Not from $input: the upstream node is a Telegram edit,\n"
+                "// whose output is the Telegram API response, not the jobs.\n"
+                "const want = new Set($('Poll Once').first().json.job_ids);\n"
+                "const src = ($('Fetch Final Jobs').first().json.data || [])\n"
+                "  .filter(j => want.has(j.id));\n"
+                "if (!src.length) {\n"
+                "  throw new Error('No jobs from this run found in the final fetch');\n"
                 "}\n"
                 "const jobs = src.filter(j => j.status === 'completed');\n"
                 "const failed = src.filter(j => j.status === 'failed');\n"
@@ -1126,7 +1191,7 @@ def build(creds):
             [{"node": "Poll Once", "type": "main", "index": 0}],
             [{"node": "Queue File", "type": "main", "index": 0}],
         ]},
-        "Poll Once": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
+        "Poll Once": {"main": [[{"node": "Prep Poll", "type": "main", "index": 0}]]},
         "Queue File": {"main": [
             [{"node": "Throttle", "type": "main", "index": 0}],
             [{"node": "Rate Limited?", "type": "main", "index": 0}],  # error output
@@ -1139,21 +1204,19 @@ def build(creds):
         "Backoff 60s": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
         "Throttle": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
 
-        "Check Jobs": {"main": [[{"node": "This Run's Jobs", "type": "main", "index": 0}]]},
-        "This Run's Jobs": {"main": [
-            [{"node": "All Jobs Done?", "type": "main", "index": 0}],
-            [{"node": "Classify Failure", "type": "main", "index": 0}],
-        ]},
+        "Prep Poll": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
+        "Check Jobs": {"main": [[{"node": "All Jobs Done?", "type": "main", "index": 0}]]},
         "All Jobs Done?": {"main": [
             [{"node": "Progress: Filing", "type": "main", "index": 0}],  # true
             [{"node": "Progress: Upload", "type": "main", "index": 0}],  # false
         ]},
-        "Progress: Filing": {"main": [[{"node": "Plan Tree", "type": "main", "index": 0}]]},
+        "Progress: Filing": {"main": [[{"node": "Fetch Final Jobs", "type": "main", "index": 0}]]},
+        "Fetch Final Jobs": {"main": [[{"node": "Plan Tree", "type": "main", "index": 0}]]},
         "Progress: Upload": {"main": [[{"node": "Wait Jobs 20s", "type": "main", "index": 0}]]},
         "Wait Jobs 20s": {"main": [[{"node": "Jobs Timeout?", "type": "main", "index": 0}]]},
         "Jobs Timeout?": {"main": [
             [{"node": "Classify Failure", "type": "main", "index": 0}],
-            [{"node": "Check Jobs", "type": "main", "index": 0}],
+            [{"node": "Prep Poll", "type": "main", "index": 0}],
         ]},
 
         # Folder tree: find-or-create the root, then the sections beneath it.
@@ -1207,10 +1270,10 @@ def build(creds):
     }
 
 
-def find_workflow():
+def find_workflow(name=WORKFLOW_NAME):
     res = api("GET", "/workflows?limit=250")
     for w in res.get("data", []):
-        if w.get("name") == WORKFLOW_NAME:
+        if w.get("name") == name:
             return w
     return None
 
@@ -1234,7 +1297,27 @@ def main():
         print("Pass --deploy to create/update the workflow.")
         return 0
 
-    wf = build(creds)
+    # The poll sub-workflow must exist first: the parent references it by id.
+    sub = build_poll_subworkflow(creds)
+    existing_sub = find_workflow(POLL_WORKFLOW_NAME)
+    if existing_sub:
+        api("PUT", "/workflows/%s" % existing_sub["id"], sub)
+        poll_id = existing_sub["id"]
+        print("updated sub-workflow %r id=%s" % (POLL_WORKFLOW_NAME, poll_id))
+    else:
+        out = api("POST", "/workflows", sub)
+        poll_id = out.get("id")
+        print("created sub-workflow %r id=%s" % (POLL_WORKFLOW_NAME, poll_id))
+
+    # n8n refuses to publish a workflow whose Execute Workflow node points at an
+    # unpublished sub-workflow, so the child must be activated before the parent.
+    try:
+        api("POST", "/workflows/%s/activate" % poll_id)
+        print("sub-workflow active")
+    except SystemExit as e:
+        print("WARNING: could not activate sub-workflow: %s" % str(e)[:160])
+
+    wf = build(creds, poll_wf_id=poll_id)
     existing = find_workflow()
     if existing:
         out = api("PUT", "/workflows/%s" % existing["id"], wf)

@@ -687,3 +687,73 @@ old code while `This Run's Jobs` was deployed referencing `job_ids` that did not
 exist — a runtime failure on the next transfer. Verifying the *stored* workflow
 after deploying caught it. "Deploy succeeded" is not evidence the intended change
 landed.
+
+---
+
+## Scaling to ~100 GB / 1600 files
+
+Asked whether the workflow could handle 100 GB across 1600 files. Measured
+answer was **no**, for three separate reasons:
+
+1. 1600 exceeded the 1000-file zip threshold, so it would have been zipped.
+2. 100 GB at the measured 24 MB/s is ~71 minutes; the download guard capped at
+   120 polls x 30s = 60 minutes and would have killed it mid-transfer.
+3. Memory. Each poll retains its whole response, and the response scales with
+   file count:
+
+```
+Check Jobs      ~0.64 KB per job,  per poll
+Check Download  ~0.77 KB per file, per poll
+```
+
+At 1600 files that is ~1.0 and ~1.2 MB per poll. Over a 71-minute transfer the
+two loops would retain ~380 MB. Execution 5 died at 150 MB.
+
+`EXECUTIONS_TIMEOUT` is unset, so n8n imposes no wall-clock limit — time was
+never the constraint, retention was.
+
+### Considered and rejected: zip then unzip in n8n
+
+Keeping the zip and unpacking it inside n8n would mean downloading a 100 GB
+archive, extracting it (~200 GB of disk) and uploading 1600 files byte by byte —
+roughly 200 GB through the container, which is exactly what the server-side
+design exists to avoid.
+
+It also only saves TorBox API calls, which were never the binding constraint,
+while converting 1600 cheap Drive *metadata* calls into 1600 Drive *uploads*
+carrying real bytes. Strictly worse on every axis except call count.
+
+### Implemented
+
+**Stage A** — zip threshold 1000 -> 5000, and adaptive poll intervals (30s/20s
+for six polls, then 60s, then 120s). Retention is (duration / interval) x
+payload, so a longer interval cuts memory and extends the time ceiling at once:
+120 download polls now cover ~3.4 hours rather than 1.
+
+**Stage B** — polling moved into a `TorBox Job Poll` sub-workflow. Each poll runs
+as its own execution: it fetches the job list, filters to this run's ids, and
+returns `{seen, expected, completed, failed, progress, done}` — about 100 bytes.
+The large payload lives and dies inside the sub-execution.
+
+The parent now:
+- builds `{hash, job_ids}` in `Prep Poll` each iteration (the only loop node
+  carrying the id list),
+- calls the sub-workflow via `Execute Workflow` (typeVersion 1, so `workflowId`
+  is a plain string rather than the resourceLocator/resourceMapper shapes of
+  later versions),
+- fetches the full job list **once** in `Fetch Final Jobs` after the loop ends,
+  purely to get file names for filing.
+
+`This Run's Jobs` is gone — the sub-workflow does that filtering now.
+
+### Deployment note
+
+n8n refuses to publish a workflow whose `Execute Workflow` node references an
+**unpublished** sub-workflow:
+
+```
+Cannot publish workflow: Node "Check Jobs" references workflow ... which is
+not published. Please publish all referenced sub-workflows first.
+```
+
+`build_workflow.py` now activates the sub-workflow before updating the parent.
