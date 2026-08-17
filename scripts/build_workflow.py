@@ -376,6 +376,26 @@ def build(creds):
             "options": {},
         }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
 
+        # GET /integration/jobs/{hash} returns every job ever created for that
+        # hash, including those from previous runs of the same link. Without
+        # this filter a second run sees 144 jobs for a 72-file folder, doubles
+        # the Drive fix-up work, and reports inflated counts. Filtering by
+        # created_at also covers the zip branch, which produces a single job.
+        node("This Run's Jobs", "n8n-nodes-base.code", 2, [2310, 160], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "const startedMs = $('Telegram Trigger').first().json.message.date * 1000;\n"
+                "const all = $input.first().json.data || [];\n"
+                "const mine = all.filter(j => {\n"
+                "  const t = Date.parse(j.created_at);\n"
+                "  return Number.isFinite(t) && t >= startedMs;\n"
+                "});\n"
+                "// Fall back to the full list rather than emitting nothing if\n"
+                "// timestamps are unparseable -- doing extra work beats doing none.\n"
+                "return [{ json: { data: mine.length ? mine : all } }];",
+        }),
+
         node("All Jobs Done?", "n8n-nodes-base.if", 2.2, [2420, 160], {
             "conditions": {
                 "combinator": "and",
@@ -417,7 +437,25 @@ def build(creds):
              {"resume": "timeInterval", "amount": 20, "unit": "seconds"},
              None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000003"}),
 
-        node("Completed Jobs", "n8n-nodes-base.code", 2, [2640, 160], {
+        # Fills the silent window between "uploads finished" and "files filed".
+        # For a 72-file folder the Drive fix-up is ~216 API calls, during which
+        # the chat would otherwise still show the original "Queued" message --
+        # especially when a cached download skips the download progress entirely.
+        # Placed before Completed Jobs so it runs once, not once per file.
+        node("Progress: Filing", "n8n-nodes-base.telegram", 1.2, [2640, 20], {
+            "resource": "message", "operation": "editMessageText",
+            "messageType": "message",
+            "chatId": chat_id,
+            "messageId": "={{ $('Ack').item.json.result.message_id }}",
+            "text": "={{ $('Check Download').first().json.data.name }}\n\n"
+                    "Uploaded. Filing "
+                    "{{ $json.data.filter(j => j.status === 'completed').length }}"
+                    " files into Drive...\n"
+                    "updated {{ $now.toFormat('HH:mm:ss') }}",
+            "additionalFields": {},
+        }, tg, {"onError": "continueRegularOutput"}),
+
+        node("Completed Jobs", "n8n-nodes-base.code", 2, [2860, 20], {
             "mode": "runOnceForAllItems",
             "language": "javaScript",
             "jsCode":
@@ -558,11 +596,13 @@ def build(creds):
         "Queue File": {"main": [[{"node": "Throttle", "type": "main", "index": 0}]]},
         "Throttle": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
 
-        "Check Jobs": {"main": [[{"node": "All Jobs Done?", "type": "main", "index": 0}]]},
+        "Check Jobs": {"main": [[{"node": "This Run's Jobs", "type": "main", "index": 0}]]},
+        "This Run's Jobs": {"main": [[{"node": "All Jobs Done?", "type": "main", "index": 0}]]},
         "All Jobs Done?": {"main": [
-            [{"node": "Completed Jobs", "type": "main", "index": 0}],   # true
+            [{"node": "Progress: Filing", "type": "main", "index": 0}],  # true
             [{"node": "Progress: Upload", "type": "main", "index": 0}],  # false
         ]},
+        "Progress: Filing": {"main": [[{"node": "Completed Jobs", "type": "main", "index": 0}]]},
         "Progress: Upload": {"main": [[{"node": "Wait Jobs 20s", "type": "main", "index": 0}]]},
         "Wait Jobs 20s": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
 
