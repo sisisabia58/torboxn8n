@@ -118,6 +118,41 @@ def resolve_credentials():
     return resolved, missing
 
 
+DRIVE_API = "https://www.googleapis.com/drive/v3/files"
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def drive_http(name, pos, method, url_expr, body_expr=None):
+    """A Drive REST call authorised with the token already minted this run.
+
+    Using the raw API rather than the Google Drive node because the folder
+    tree needs find-or-create semantics the node does not offer, and because
+    one PATCH can set name and parent together -- the node splits those into
+    two operations (three API calls per file).
+    """
+    params = {
+        "method": method,
+        "url": url_expr,
+        "sendHeaders": True,
+        "specifyHeaders": "keypair",
+        "headerParameters": {"parameters": [
+            {"name": "Authorization",
+             "value": "=Bearer {{ $('Mint Token').first().json.access_token }}"},
+            {"name": "User-Agent", "value": UA},
+        ]},
+        "options": {},
+    }
+    if body_expr is not None:
+        params.update({
+            "sendBody": True,
+            "contentType": "json",
+            "specifyBody": "json",
+            "jsonBody": body_expr,
+        })
+    return node(name, "n8n-nodes-base.httpRequest", 4.2, pos, params,
+                None, {"alwaysOutputData": True})
+
+
 def node(name, ntype, tv, pos, params, creds=None, extra=None):
     n = {
         "parameters": params,
@@ -455,55 +490,164 @@ def build(creds):
             "additionalFields": {},
         }, tg, {"onError": "continueRegularOutput"}),
 
-        node("Completed Jobs", "n8n-nodes-base.code", 2, [2860, 20], {
+        # TorBox flattens the source path into the filename, e.g.
+        #   "Course/02-FUNDAMENTALS/01-FBT.mp4"
+        # Plan Tree recovers the structure from those names.
+        node("Plan Tree", "n8n-nodes-base.code", 2, [2860, 20], {
             "mode": "runOnceForAllItems",
             "language": "javaScript",
             "jsCode":
-                "// Emit one item per successful upload so the Drive fix-up runs\n"
-                "// per file. Failed jobs are handled on the error path.\n"
-                "const jobs = $input.first().json.data;\n"
-                "return jobs\n"
-                "  .filter(j => j.status === 'completed')\n"
-                "  .map(j => ({ json: {\n"
-                "    job_id: j.id,\n"
-                "    file_name: j.file_name,\n"
-                "    final_name: String(j.file_name || '').split('/').pop(),\n"
-                "  } }));",
+                "// Recover a two-level tree (root/section/file) from the\n"
+                "// flattened names TorBox produces. Anything deeper than two\n"
+                "// levels collapses into its level-2 section, by design.\n"
+                "const jobs = ($input.first().json.data || [])\n"
+                "  .filter(j => j.status === 'completed');\n"
+                "\n"
+                "const files = jobs.map(j => {\n"
+                "  const parts = String(j.file_name || '').split('/');\n"
+                "  const final_name = parts.pop();\n"
+                "  const root = parts.length ? parts[0] : '';\n"
+                "  const section = parts.length > 1 ? parts[1] : '';\n"
+                "  return { job_id: j.id, file_name: j.file_name, final_name, root, section };\n"
+                "});\n"
+                "\n"
+                "const root = (files.find(f => f.root) || {}).root || 'TorBox Transfer';\n"
+                "const sections = [...new Set(files.map(f => f.section).filter(Boolean))];\n"
+                "return [{ json: { root, sections, files, file_count: files.length } }];",
         }),
 
-        # TorBox uploads arrive orphaned, with the source path flattened into
-        # the filename. The next three nodes find, rename, and file them.
-        node("Find In Drive", "n8n-nodes-base.googleDrive", 3, [2860, 160], {
-            "authentication": "oAuth2",
-            "resource": "fileFolder",
-            "operation": "search",
-            "searchMethod": "query",
-            "queryString": "={{ \"name = '\" + $json.file_name.replace(/'/g, \"\\\\'\")"
-                           " + \"' and trashed = false\" }}",
-            "returnAll": False,
-            "limit": 5,
-            "filter": {"whatToSearch": "files", "includeTrashed": False},
-            "options": {},
-        }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
+        drive_http("Find Root", [3080, 20], "GET",
+                   "={{ 'https://www.googleapis.com/drive/v3/files?q=' + "
+                   "encodeURIComponent(\"name='\" + $json.root.replace(/'/g, \"\\\\'\") + "
+                   "\"' and '" + DRIVE_FOLDER_ID + "' in parents and mimeType='" +
+                   FOLDER_MIME + "' and trashed=false\") + '&fields=files(id,name)' }}"),
 
-        # file:update renames only -- it cannot move. Moving is a separate
-        # operation; see docs/node-schemas.md.
-        node("Rename File", "n8n-nodes-base.googleDrive", 3, [3080, 160], {
-            "authentication": "oAuth2",
-            "resource": "file",
-            "operation": "update",
-            "fileId": {"__rl": True, "mode": "id", "value": "={{ $json.id }}"},
-            "newUpdatedFileName": "={{ $('Completed Jobs').item.json.final_name }}",
+        node("Root Missing?", "n8n-nodes-base.if", 2.2, [3300, 20], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "loose", "version": 2},
+                "conditions": [{
+                    "id": "no-root",
+                    "leftValue": "={{ ($json.files || []).length }}",
+                    "rightValue": 0,
+                    "operator": {"type": "number", "operation": "equals"},
+                }],
+            },
+            "looseTypeValidation": True,
             "options": {},
-        }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
+        }),
 
-        node("Move To Folder", "n8n-nodes-base.googleDrive", 3, [3300, 160], {
-            "authentication": "oAuth2",
-            "resource": "file",
-            "operation": "move",
-            "fileId": {"__rl": True, "mode": "id", "value": "={{ $json.id }}"},
-            "folderId": {"__rl": True, "mode": "id", "value": DRIVE_FOLDER_ID},
-        }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
+        drive_http("Create Root", [3520, -100], "POST",
+                   "=" + DRIVE_API + "?fields=id,name",
+                   "={{ JSON.stringify({ name: $('Plan Tree').first().json.root,"
+                   " mimeType: '" + FOLDER_MIME + "',"
+                   " parents: ['" + DRIVE_FOLDER_ID + "'] }) }}"),
+
+        # Reached from either branch, so it normalises both response shapes:
+        # create returns {id}, search returns {files:[{id}]}.
+        node("Root Ready", "n8n-nodes-base.code", 2, [3740, 20], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "const j = $input.first().json;\n"
+                "const rootId = j.id || ((j.files || [])[0] || {}).id;\n"
+                "if (!rootId) throw new Error('Could not resolve the root folder id');\n"
+                "return [{ json: { rootId } }];",
+        }),
+
+        drive_http("List Sections", [3960, 20], "GET",
+                   "={{ 'https://www.googleapis.com/drive/v3/files?q=' + "
+                   "encodeURIComponent(\"'\" + $json.rootId + \"' in parents and mimeType='" +
+                   FOLDER_MIME + "' and trashed=false\") + "
+                   "'&pageSize=200&fields=files(id,name)' }}"),
+
+        node("Plan Sections", "n8n-nodes-base.code", 2, [4180, 20], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// Always emit exactly one item. A node that emits zero items\n"
+                "// stops the branch, which would strand the run when every\n"
+                "// section already exists.\n"
+                "const existing = ($input.first().json.files || []);\n"
+                "const have = new Set(existing.map(f => f.name));\n"
+                "const needed = $('Plan Tree').first().json.sections;\n"
+                "const missing = needed.filter(s => !have.has(s));\n"
+                "return [{ json: {\n"
+                "  rootId: $('Root Ready').first().json.rootId,\n"
+                "  missing,\n"
+                "  missing_count: missing.length,\n"
+                "} }];",
+        }),
+
+        node("Any Missing?", "n8n-nodes-base.if", 2.2, [4400, 20], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "loose", "version": 2},
+                "conditions": [{
+                    "id": "has-missing",
+                    "leftValue": "={{ $json.missing_count }}",
+                    "rightValue": 0,
+                    "operator": {"type": "number", "operation": "gt"},
+                }],
+            },
+            "looseTypeValidation": True,
+            "options": {},
+        }),
+
+        node("Split Sections", "n8n-nodes-base.code", 2, [4620, -100], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "const j = $input.first().json;\n"
+                "return j.missing.map(name => ({ json: { name, rootId: j.rootId } }));",
+        }),
+
+        node("Section Loop", "n8n-nodes-base.splitInBatches", 3, [4840, -100],
+             {"batchSize": 1, "options": {"reset": False}}),
+
+        drive_http("Create Section", [5060, -20], "POST",
+                   "=" + DRIVE_API + "?fields=id,name",
+                   "={{ JSON.stringify({ name: $json.name,"
+                   " mimeType: '" + FOLDER_MIME + "',"
+                   " parents: [$json.rootId] }) }}"),
+
+        # Re-listed after creation so the map covers pre-existing and new alike.
+        drive_http("List Sections Final", [5280, 20], "GET",
+                   "={{ 'https://www.googleapis.com/drive/v3/files?q=' + "
+                   "encodeURIComponent(\"'\" + $('Root Ready').first().json.rootId + "
+                   "\"' in parents and mimeType='" + FOLDER_MIME + "' and trashed=false\") + "
+                   "'&pageSize=200&fields=files(id,name)' }}"),
+
+        node("Build Map", "n8n-nodes-base.code", 2, [5500, 20], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// One item per file, carrying the folder it belongs in.\n"
+                "const map = {};\n"
+                "for (const f of ($input.first().json.files || [])) map[f.name] = f.id;\n"
+                "const rootId = $('Root Ready').first().json.rootId;\n"
+                "return $('Plan Tree').first().json.files.map(f => ({ json: {\n"
+                "  file_name: f.file_name,\n"
+                "  final_name: f.final_name,\n"
+                "  target: f.section ? (map[f.section] || rootId) : rootId,\n"
+                "} }));",
+        }),
+
+        drive_http("Find File", [5720, 20], "GET",
+                   "={{ 'https://www.googleapis.com/drive/v3/files?q=' + "
+                   "encodeURIComponent(\"name='\" + $json.file_name.replace(/'/g, \"\\\\'\") + "
+                   "\"' and trashed=false\") + '&fields=files(id,name,parents)' }}"),
+
+        # Rename and reparent in a single PATCH. The Google Drive node splits
+        # these into two operations costing three API calls per file; this is
+        # one. Uploads arrive orphaned, so there is nothing to removeParents.
+        drive_http("File Into Place", [5940, 20], "PATCH",
+                   "={{ 'https://www.googleapis.com/drive/v3/files/' + "
+                   "(($json.files || [])[0] || {}).id + '?addParents=' + "
+                   "$('Build Map').item.json.target + '&fields=id,name,parents' }}",
+                   "={{ JSON.stringify({ name: $('Build Map').item.json.final_name }) }}"),
 
         # --- Task 8: report and log ------------------------------------------
         # Move To Folder emits one item per file, so without this fan-in the
@@ -602,14 +746,38 @@ def build(creds):
             [{"node": "Progress: Filing", "type": "main", "index": 0}],  # true
             [{"node": "Progress: Upload", "type": "main", "index": 0}],  # false
         ]},
-        "Progress: Filing": {"main": [[{"node": "Completed Jobs", "type": "main", "index": 0}]]},
+        "Progress: Filing": {"main": [[{"node": "Plan Tree", "type": "main", "index": 0}]]},
         "Progress: Upload": {"main": [[{"node": "Wait Jobs 20s", "type": "main", "index": 0}]]},
         "Wait Jobs 20s": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
 
-        "Completed Jobs": {"main": [[{"node": "Find In Drive", "type": "main", "index": 0}]]},
-        "Find In Drive": {"main": [[{"node": "Rename File", "type": "main", "index": 0}]]},
-        "Rename File": {"main": [[{"node": "Move To Folder", "type": "main", "index": 0}]]},
-        "Move To Folder": {"main": [[{"node": "Summarize", "type": "main", "index": 0}]]},
+        # Folder tree: find-or-create the root, then the sections beneath it.
+        "Plan Tree": {"main": [[{"node": "Find Root", "type": "main", "index": 0}]]},
+        "Find Root": {"main": [[{"node": "Root Missing?", "type": "main", "index": 0}]]},
+        "Root Missing?": {"main": [
+            [{"node": "Create Root", "type": "main", "index": 0}],  # true  -> create
+            [{"node": "Root Ready", "type": "main", "index": 0}],   # false -> reuse
+        ]},
+        "Create Root": {"main": [[{"node": "Root Ready", "type": "main", "index": 0}]]},
+        "Root Ready": {"main": [[{"node": "List Sections", "type": "main", "index": 0}]]},
+        "List Sections": {"main": [[{"node": "Plan Sections", "type": "main", "index": 0}]]},
+        "Plan Sections": {"main": [[{"node": "Any Missing?", "type": "main", "index": 0}]]},
+        "Any Missing?": {"main": [
+            [{"node": "Split Sections", "type": "main", "index": 0}],       # true
+            [{"node": "List Sections Final", "type": "main", "index": 0}],  # false
+        ]},
+        "Split Sections": {"main": [[{"node": "Section Loop", "type": "main", "index": 0}]]},
+        # splitInBatches outputs are ordered [done, loop]
+        "Section Loop": {"main": [
+            [{"node": "List Sections Final", "type": "main", "index": 0}],
+            [{"node": "Create Section", "type": "main", "index": 0}],
+        ]},
+        "Create Section": {"main": [[{"node": "Section Loop", "type": "main", "index": 0}]]},
+
+        # Per-file placement: locate the upload, then rename+reparent in one call.
+        "List Sections Final": {"main": [[{"node": "Build Map", "type": "main", "index": 0}]]},
+        "Build Map": {"main": [[{"node": "Find File", "type": "main", "index": 0}]]},
+        "Find File": {"main": [[{"node": "File Into Place", "type": "main", "index": 0}]]},
+        "File Into Place": {"main": [[{"node": "Summarize", "type": "main", "index": 0}]]},
         "Summarize": {"main": [[{"node": "Done", "type": "main", "index": 0}]]},
         "Done": {"main": [[{"node": "Log Success", "type": "main", "index": 0}]]},
     }
