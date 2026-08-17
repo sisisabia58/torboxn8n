@@ -54,5 +54,8 @@ except Exception as e:
 PY
 }
 
-create "TorBox API"    "torBoxApi"      "$(python -c 'import json,sys; print(json.dumps({"apiKey": sys.argv[1]}))' "$TB")"
+# Only the header-auth credential is created. The community node's torBoxApi
+# credential type no longer exists on the instance (Railway wiped the package),
+# and the workflow no longer needs it -- all TorBox calls go through plain
+# HTTP Request nodes using this Bearer header.
 create "TorBox Bearer" "httpHeaderAuth" "$(python -c 'import json,sys; print(json.dumps({"name": "Authorization", "value": "Bearer " + sys.argv[1]}))' "$TB")"

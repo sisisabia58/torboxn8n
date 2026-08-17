@@ -67,3 +67,44 @@ Findings:
 
 Not yet exercised: the multi-iteration loop. This download finished in a single
 cycle, so the `$runIndex >= 1` branch that renders MB/s has never rendered.
+
+---
+
+## Infrastructure findings (Railway + Postgres, 2026-08-17)
+
+Three failures during deployment, none of them workflow logic. Recorded because
+each presented as something other than its cause.
+
+### Community node vanished
+`n8n-nodes-torbox` disappeared from the instance mid-session. Symptom: the
+Telegram bot stopped responding entirely, with no error visible to the user.
+Cause: n8n could not activate the workflow (`Unrecognized node type:
+n8n-nodes-torbox.torBox`), so it never registered the Telegram webhook.
+
+Confirmed independently: creating a `torBoxApi` credential succeeded earlier in
+the session and later failed with `req.body.type is not a known type`.
+
+Resolved by removing the dependency — both operations are plain HTTP calls.
+
+### Encryption key changed once
+Symptom: `Credentials could not be decrypted. The likely reason is that a
+different "encryptionKey" was used`.
+
+Initially misdiagnosed as the key rotating on every deploy. A volume **is**
+mounted at `/home/node/.n8n`, so the key does persist. Testing showed a
+newly created credential activates fine, so the current key is stable — the
+key changed **once**, most plausibly when the volume was first attached and
+masked the pre-existing `.n8n` directory.
+
+Consequence: credentials created before that event are permanently unreadable
+and must be recreated. Credentials created after are fine.
+
+### $env blocked, Variables licensed
+`n8n Variables` is a licensed feature (403 on community edition), and `$env`
+was blocked by `N8N_BLOCK_ENV_ACCESS_IN_NODE` in both Code-node and expression
+contexts. Verified with a throwaway probe workflow rather than by burning a
+download run.
+
+Note that setting `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` exposes every
+environment variable — including `N8N_ENCRYPTION_KEY` — to every workflow on
+the instance.
