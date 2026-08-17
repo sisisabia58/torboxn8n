@@ -232,6 +232,49 @@ def build(creds):
             "additionalFields": {"appendAttribution": False},
         }, tg),
 
+        # Pre-flight. Execution 23 downloaded 12.56 GiB, queued 253 uploads, and
+        # every one failed because the account was in cooldown -- a condition
+        # knowable in one cheap call before any of that work started.
+        node("Check Account", "n8n-nodes-base.httpRequest", 4.2, [220, 20], {
+            "method": "GET",
+            "url": TORBOX_API + "/user/me",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "options": {},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]},
+           {"onError": "continueErrorOutput"}),
+
+        node("Account OK?", "n8n-nodes-base.code", 2, [440, 20], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// Fail fast and specifically. Both of these present downstream\n"
+                "// as 'Failed to get file for upload', which reads like a\n"
+                "// transient TorBox glitch rather than an account problem.\n"
+                "const d = ($input.first().json || {}).data || {};\n"
+                "const now = Date.now();\n"
+                "\n"
+                "const cooldown = d.cooldown_until ? Date.parse(d.cooldown_until) : 0;\n"
+                "if (cooldown && cooldown > now) {\n"
+                "  const hrs = ((cooldown - now) / 3600000).toFixed(1);\n"
+                "  throw new Error('TorBox account is in cooldown for another '\n"
+                "    + hrs + 'h (until ' + d.cooldown_until + '). Downloads would "
+                "succeed but every upload fails.');\n"
+                "}\n"
+                "\n"
+                "const premium = d.premium_expires_at ? Date.parse(d.premium_expires_at) : 0;\n"
+                "if (premium && premium < now) {\n"
+                "  throw new Error('TorBox premium expired on ' + d.premium_expires_at\n"
+                "    + '. Web downloads require a paid plan.');\n"
+                "}\n"
+                "\n"
+                "return [{ json: { ok: true, plan: d.plan,\n"
+                "  premium_expires_at: d.premium_expires_at } }];",
+        }, None, {"onError": "continueErrorOutput"}),
+
         # Deliberately NOT the n8n-nodes-torbox community node: Railway wipes
         # ~/.n8n/nodes on every deploy, which silently prevents the workflow
         # from activating ("Unrecognized node type") and leaves the Telegram
@@ -863,9 +906,16 @@ def build(creds):
                 "const j = $input.first().json || {};\n"
                 "const raw = JSON.stringify(j);\n"
                 "\n"
+                "// n8n puts a node's thrown message at .error as a PLAIN STRING\n"
+                "// on the error output. Reading .error.message silently yields\n"
+                "// undefined and reported 'No detail provided.' while the real\n"
+                "// reason sat right there.\n"
+                "const pick = (v) => (typeof v === 'string' && v) ? v\n"
+                "  : (v && typeof v === 'object' && v.message) ? v.message : null;\n"
+                "\n"
                 "let stage = 'unknown';\n"
-                "let reason = j.error?.message || j.message || j.detail\n"
-                "  || 'No detail provided.';\n"
+                "let reason = pick(j.error) || pick(j.message) || pick(j.detail)\n"
+                "  || pick(j.error?.description) || 'No detail provided.';\n"
                 "\n"
                 "// Cloudflare answers unfamiliar clients with an unstructured\n"
                 "// 1010 body. It reads like an auth failure and is not one.\n"
@@ -877,7 +927,13 @@ def build(creds):
                 "  stage = 'download';\n"
                 "} else if (raw.includes('access_token') || raw.includes('invalid_grant')) {\n"
                 "  stage = 'token';\n"
-                "} else if (raw.includes('integration/googledrive') || raw.includes('job')) {\n"
+                "} else if (/failed to get file for upload/i.test(raw)) {\n"
+                "  stage = 'torbox-unavailable';\n"
+                "  reason = 'TorBox could not serve the file. Usually an account "
+                "cooldown or an expired plan \\u2014 check /user/me for "
+                "cooldown_until and premium_expires_at. Original: ' + reason;\n"
+                "} else if (/uploads failed/i.test(raw) "
+                "|| raw.includes('integration/googledrive') || raw.includes('job')) {\n"
                 "  stage = 'upload';\n"
                 "}\n"
                 "\n"
@@ -934,7 +990,15 @@ def build(creds):
             [{"node": "Ack", "type": "main", "index": 0}],       # true
             [{"node": "Reject", "type": "main", "index": 0}],    # false
         ]},
-        "Ack": {"main": [[{"node": "Create Download", "type": "main", "index": 0}]]},
+        "Ack": {"main": [[{"node": "Check Account", "type": "main", "index": 0}]]},
+        "Check Account": {"main": [
+            [{"node": "Account OK?", "type": "main", "index": 0}],
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+        ]},
+        "Account OK?": {"main": [
+            [{"node": "Create Download", "type": "main", "index": 0}],
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+        ]},
         "Create Download": {"main": [
             [{"node": "Check Download", "type": "main", "index": 0}],
             [{"node": "Classify Failure", "type": "main", "index": 0}],

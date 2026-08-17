@@ -317,3 +317,53 @@ roadmap was written.
   transfer while a generous one only wastes wall clock on a stuck one.
 - Added a 429 backoff on `Queue File`'s error output, warranted now that
   headroom is smaller.
+
+---
+
+## Execution 23 — the failure path works; TorBox account was in cooldown
+
+**253 files, 12.56 GiB.** Download completed cleanly
+(`finished=True present=True cached=True files=253`), all 253 queue requests
+were accepted with no HTTP errors, and then **all 253 upload jobs failed** with
+`Failed to get file for upload. Please try again.`
+
+Cause: the TorBox account was in cooldown.
+
+```
+web_downloads_downloaded   7
+total_bytes_downloaded     33.28 GiB
+cooldown_until             2026-08-18T06:49:50Z   (~23h out)
+premium_expires_at         2026-08-18T00:39:14Z
+```
+
+Confirmed by queueing a **single** upload by hand — it failed identically, with
+an empty `file_name`. So this was not volume, concurrency, or the retuned
+throttle; the account simply could not serve files.
+
+Note the ordering trap: cooldown lifts ~6 hours **after** premium expires, so the
+account goes straight from throttled to unpaid.
+
+### What worked
+
+The failure path ran for the first time: `Plan Tree` threw, routed to its error
+output, and `Classify Failure → Report Failure → Log Failure` delivered a ❌ to
+Telegram and a `failure` row to the sheet. That is roadmap 2.1 proven.
+
+### Two real bugs found
+
+**1. The classifier discarded the reason.** It reported
+`stage=unknown, reason=No detail provided.` while `Plan Tree`'s output held
+`{"error": "Failed to get file for upload..."}`.
+
+n8n places a thrown message at `.error` as a **plain string**. The code read
+`j.error?.message` — undefined on a string — and fell through to the default.
+The same shape had already appeared on the `Done` node earlier in the session;
+the lesson was not generalised then. Now handled via a `pick()` helper that
+accepts either a string or an object, plus a specific `torbox-unavailable`
+classification for this message that names cooldown and plan expiry as the
+usual causes.
+
+**2. No pre-flight check.** The run downloaded 12.56 GiB and queued 253 uploads
+before discovering a condition that one call to `/user/me` would have revealed
+up front. Added `Check Account` → `Account OK?` ahead of `Create Download`,
+which fails fast and specifically on an active cooldown or an expired plan.
