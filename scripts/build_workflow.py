@@ -30,6 +30,13 @@ TORBOX_API = "https://api.torbox.app/v1/api"
 # and uploads land orphaned, so the workflow moves them here itself).
 DRIVE_FOLDER_ID = "1ERCHFMwp1jPVgFQPM4VPN4mlObA2pzwI"
 
+# Attempt log. Tab name and header row were read from the live spreadsheet,
+# not assumed: tab "Sheet1" (gid=0), columns timestamp, telegram_user,
+# source_link, folder_name, size_bytes, file_count, outcome, stage, error,
+# duration_sec.
+SHEET_ID = "15gN93Ly5x1XBXWrTjPsk6kMGtjF1IgVuf_jpIvBZez0"
+SHEET_TAB = "Sheet1"
+
 # Above this many files, upload one zip instead of one job per file, to stay
 # clear of TorBox's 300 requests/min limit.
 #
@@ -459,6 +466,65 @@ def build(creds):
             "fileId": {"__rl": True, "mode": "id", "value": "={{ $json.id }}"},
             "folderId": {"__rl": True, "mode": "id", "value": DRIVE_FOLDER_ID},
         }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
+
+        # --- Task 8: report and log ------------------------------------------
+        # Move To Folder emits one item per file, so without this fan-in the
+        # final message and the log row would fire once per file.
+        node("Summarize", "n8n-nodes-base.code", 2, [3520, 160], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// Collapse the per-file branch into a single summary item.\n"
+                "const moved = $input.all().length;\n"
+                "const dl = $('Check Download').first().json.data;\n"
+                "const startedMs = $('Telegram Trigger').first().json.message.date * 1000;\n"
+                "return [{ json: {\n"
+                "  moved,\n"
+                "  folder_name: dl.name,\n"
+                "  size_bytes: dl.size,\n"
+                "  file_count: (dl.files || []).length,\n"
+                "  duration_sec: Math.round((Date.now() - startedMs) / 1000),\n"
+                "} }];",
+        }),
+
+        node("Done", "n8n-nodes-base.telegram", 1.2, [3740, 160], {
+            "resource": "message", "operation": "editMessageText",
+            "messageType": "message",
+            "chatId": chat_id,
+            "messageId": "={{ $('Ack').item.json.result.message_id }}",
+            "text": "={{ '\\u2705 ' + $json.folder_name }}\n\n"
+                    "{{ $json.moved }}/{{ $json.file_count }} files"
+                    " · {{ ($json.size_bytes / 1073741824).toFixed(2) }} GB\n"
+                    "Uploaded to Google Drive in {{ $json.duration_sec }}s",
+            "additionalFields": {},
+        }, tg, {"onError": "continueRegularOutput"}),
+
+        node("Log Success", "n8n-nodes-base.googleSheets", 4.5, [3960, 160], {
+            "authentication": "oAuth2",
+            "resource": "sheet",
+            "operation": "append",
+            "documentId": {"__rl": True, "mode": "id", "value": SHEET_ID},
+            "sheetName": {"__rl": True, "mode": "name", "value": SHEET_TAB},
+            "columns": {
+                "mappingMode": "defineBelow",
+                "value": {
+                    "timestamp": "={{ $now.toISO() }}",
+                    "telegram_user":
+                        "={{ $('Telegram Trigger').first().json.message.from.username }}",
+                    "source_link":
+                        "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "folder_name": "={{ $('Summarize').item.json.folder_name }}",
+                    "size_bytes": "={{ $('Summarize').item.json.size_bytes }}",
+                    "file_count": "={{ $('Summarize').item.json.file_count }}",
+                    "outcome": "success",
+                    "stage": "complete",
+                    "error": "",
+                    "duration_sec": "={{ $('Summarize').item.json.duration_sec }}",
+                },
+            },
+            "options": {},
+        }, {"googleSheetsOAuth2Api": creds["googleSheetsOAuth2Api"]},
+           {"onError": "continueRegularOutput"}),
     ]
 
     connections = {
@@ -503,6 +569,9 @@ def build(creds):
         "Completed Jobs": {"main": [[{"node": "Find In Drive", "type": "main", "index": 0}]]},
         "Find In Drive": {"main": [[{"node": "Rename File", "type": "main", "index": 0}]]},
         "Rename File": {"main": [[{"node": "Move To Folder", "type": "main", "index": 0}]]},
+        "Move To Folder": {"main": [[{"node": "Summarize", "type": "main", "index": 0}]]},
+        "Summarize": {"main": [[{"node": "Done", "type": "main", "index": 0}]]},
+        "Done": {"main": [[{"node": "Log Success", "type": "main", "index": 0}]]},
     }
 
     return {
