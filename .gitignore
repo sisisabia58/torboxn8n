@@ -1,0 +1,10 @@
+# Secrets - never commit
+.env
+.env.local
+
+# Brainstorming companion session files
+.superpowers/
+
+# Python
+__pycache__/
+*.pyc
