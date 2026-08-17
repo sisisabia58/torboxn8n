@@ -191,6 +191,14 @@ permissions error, not a billing one. Cheap to detect: `GET /user/me` exposes
   no benefit now that the server-side path works.
 - **Reinstating the community node.** Plain HTTP Request calls depend on n8n core
   only and cannot be wiped by a redeploy.
+- **Switching the TorBox credential to `httpBearerAuth`.** The Header Auth
+  credential requires typing `Bearer ` before the key, and pasting the bare key
+  produced a 401 twice — once per instance. `httpBearerAuth` takes just the token
+  and adds the prefix itself, which would make the mistake impossible rather than
+  merely well-diagnosed. Considered and declined: it works as-is, and
+  `Classify Failure` now reports the exact cause and remedy. Revisit if it
+  happens a third time.
+
 - **A sub-workflow split of the whole pipeline.** At 45 nodes it is large but
   linear and readable. Only the recursive path resolver (1.4) genuinely wants
   extraction.
