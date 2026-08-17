@@ -87,7 +87,15 @@ timestamp | telegram_user | source_link | folder_name | size_bytes | file_count 
 
 - [ ] **Step 6: Create Google Drive, Google Sheets, and Telegram credentials**
 
-Use the same Google Cloud OAuth client already created during design (Desktop app type, Drive API enabled).
+n8n's Google credentials need a **Web application** OAuth client — not the Desktop
+app client used by `scripts/google_oauth.py`. Desktop clients only allow
+`http://localhost` redirects, so they cannot serve n8n's callback.
+
+In Google Cloud, create a second OAuth client of type **Web application** and add
+n8n's redirect URI (shown in the n8n credential screen, of the form
+`https://<your-n8n>/rest/oauth2-credential/callback`) to its authorized redirect URIs.
+
+Keep the Desktop client — it still produces `GOOGLE_REFRESH_TOKEN` for Task 5.
 
 **Critical:** the consent screen must be **published**, not left in Testing. Google expires refresh tokens after 7 days while in Testing, which silently kills the workflow weekly.
 
@@ -489,17 +497,31 @@ name = '{{ $json.file_name.replace(/'/g, "\\'") }}' and trashed = false
 
 The flattened name TorBox produces is highly specific (it contains the full source path), which makes this lookup effectively unique.
 
-- [ ] **Step 6: Move and rename**
+- [ ] **Step 6: Rename, then move — two separate nodes**
 
-Add **Google Drive → File → Update** named `Fix Placement`.
-- File ID: `{{ $json.id }}`
-- **New Name**:
+> **Verified constraint:** Google Drive's `file:update` operation **cannot move a
+> file**. Its execute function PATCHes only `name` and binary content and never
+> touches `parents`; there is no `addParents` parameter on it. Moving is the
+> separate `file:move` operation. Setting a folder on the Update node would be
+> silently ignored and the file would stay orphaned while everything reported
+> success. See `docs/node-schemas.md`.
+
+Add **Google Drive → File → Update** named `Rename File`:
+- File ID: resourceLocator, mode **By ID**, value `{{ $json.id }}`
+- New Updated File Name:
 ```
 {{ $('Completed Jobs').item.json.file_name.split('/').pop() }}
 ```
-- Options → **Parent Drive ID / Folder**: your target folder ID from Task 1 Step 7.
 
-Both operations are metadata-only. No bytes move, so this costs the same for a 30 KB text file and a 200 GB video.
+Then add **Google Drive → File → Move** named `Move To Folder`:
+- File ID: resourceLocator, mode **By ID**, value `{{ $('Rename File').item.json.id }}`
+- Parent Folder: resourceLocator, mode **By ID**, value = your target folder ID from Task 1 Step 7
+
+Both are metadata-only. No bytes move, so this costs the same for a 30 KB text file
+and a 200 GB video.
+
+The uploaded files are orphaned (no parents), so `move`'s internal `removeParents`
+resolves to an empty string — harmless.
 
 - [ ] **Step 7: Test**
 
