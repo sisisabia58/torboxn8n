@@ -35,8 +35,9 @@ DRIVE_FOLDER_ID = "1ERCHFMwp1jPVgFQPM4VPN4mlObA2pzwI"
 FILE_COUNT_THRESHOLD = 30
 
 # Credentials required, by n8n credential type -> credential NAME on the instance.
+# torBoxApi is intentionally absent: the workflow no longer uses the community
+# node, so it needs no community credential type either.
 REQUIRED_CREDS = {
-    "torBoxApi": "TorBox API",
     "httpHeaderAuth": "TorBox Bearer",
     "telegramApi": "Telegram",
     "googleDriveOAuth2Api": "Google Drive",
@@ -161,23 +162,42 @@ def build(creds):
             "additionalFields": {"appendAttribution": False},
         }, tg),
 
-        node("Create Download", "n8n-nodes-torbox.torBox", 1, [440, 160], {
-            "resource": "webdl",
-            "operation": "createWebDownload",
-            "link": "={{ $('Telegram Trigger').item.json.message.text"
-                    ".match(/https?:\\/\\/mega\\.nz\\/\\S+/)[0] }}",
+        # Deliberately NOT the n8n-nodes-torbox community node: Railway wipes
+        # ~/.n8n/nodes on every deploy, which silently prevents the workflow
+        # from activating ("Unrecognized node type") and leaves the Telegram
+        # webhook unregistered. Plain HTTP Request depends on n8n core only.
+        node("Create Download", "n8n-nodes-base.httpRequest", 4.2, [440, 160], {
+            "method": "POST",
+            "url": TORBOX_API + "/webdl/createwebdownload",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "sendBody": True,
+            "contentType": "form-urlencoded",
+            "bodyParameters": {"parameters": [
+                {"name": "link",
+                 "value": "={{ $('Telegram Trigger').item.json.message.text"
+                          ".match(/https?:\\/\\/mega\\.nz\\/\\S+/)[0] }}"},
+            ]},
             "options": {},
-        }, {"torBoxApi": creds["torBoxApi"]},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]},
            {"retryOnFail": True, "maxTries": 3, "waitBetweenTries": 2000}),
 
-        node("Check Download", "n8n-nodes-torbox.torBox", 1, [660, 160], {
-            "resource": "webdl",
-            "operation": "getWebDownloadList",
-            "options": {
-                "id": "={{ $('Create Download').item.json.data.webdownload_id }}",
-                "bypass_cache": True,
-            },
-        }, {"torBoxApi": creds["torBoxApi"]}),
+        # Query string is built into the URL rather than via queryParameters so
+        # this depends on no parameter names beyond method/url.
+        node("Check Download", "n8n-nodes-base.httpRequest", 4.2, [660, 160], {
+            "method": "GET",
+            "url": "={{ '" + TORBOX_API + "/webdl/mylist?bypass_cache=true&id=' + "
+                   "$('Create Download').item.json.data.webdownload_id }}",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "options": {},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
 
         node("Download Done?", "n8n-nodes-base.if", 2.2, [880, 160], {
             "conditions": {
