@@ -10,6 +10,21 @@ Ordered by what I would do first, not by category.
 
 ## Tier 1 — Known defects
 
+### 1.0 The job list grows without bound per hash
+`GET /integration/jobs/{hash}` returned **1742 jobs for a 441-file folder** —
+jobs accumulate across every re-run of the same link. Each poll fetches all of
+them (~1 MB and climbing), and that is now the single largest contributor to
+execution data.
+
+It is not yet a problem: the 441-file run used 3.0 MB total. But it grows
+monotonically with every resend, so a frequently retried link will eventually
+recreate the memory failure that `Poll Once` just fixed.
+
+**Fix:** poll the specific `job_id`s returned by `Queue File` via
+`GET /integration/job/{id}` instead of fetching the whole hash. That also closes
+defect 1.1, which needs the same job-id tracking.
+**Effort:** medium · **Risk:** medium — replaces the polling mechanism.
+
 ### 1.1 Same-link concurrency
 `This Run's Jobs` filters by `created_at >= <telegram message time>`. Two runs of
 the **same** link share a TorBox hash, so the earlier run's cutoff also matches
@@ -56,19 +71,21 @@ silently lossy for deeper trees.
 These are not known-broken. They are **unproven**, which is a different and
 easier-to-forget kind of risk.
 
-### 2.1 The failure path
-`Classify Failure -> Report Failure -> Log Failure` has never run. It is the
-machinery that makes failures visible, so its own failure would be doubly
-invisible. **Test: send a syntactically valid but dead Mega link.** Costs nothing.
+### 2.1 ~~The failure path~~ — PROVEN
+Ran for real several times (TorBox cooldown, then a 401). The first attempt
+reported `stage=unknown / No detail provided`; after fixing string-error
+extraction and adding auth classification it now reports the exact cause and
+remedy. Working as intended.
 
 ### 2.2 Loop timeout guards
 Neither the 120-poll download cap nor the 180-poll job cap has ever tripped.
 **Test: temporarily lower a cap to 2 and run.**
 
-### 2.3 The zip branch
-Never executed once, across the entire build. Both original attempts failed for
-unrelated reasons. It activates above 150 files; the largest real folder tested
-was 123. **Test: temporarily lower the threshold.**
+### 2.3 The zip branch — STILL NEVER EXECUTED
+Threshold is now 1000 files and the largest real folder tested is 441, so it is
+even less likely to fire by accident. Untested code that only runs on the biggest
+transfers is the worst combination. **Test by temporarily lowering the
+threshold**, or delete the branch if per-file is always preferred.
 
 ### 2.4 Partial upload failures
 The warning line for "5 of 72 uploads failed" has never rendered, because no
@@ -106,6 +123,14 @@ to split the download wait into a resumable sub-workflow.
 ---
 
 ## Tier 4 — Performance
+
+### 4.0 ~~HTTP nodes fan out per input item~~ — FIXED
+`Check Jobs` ran once per input item because a batch loop's done output emits
+everything it processed: 253 identical API calls and 253 retained copies of the
+job list, 97.9% of all execution data. A 400+ file folder reached 150 MB and
+died. `Poll Once` collapses the fan-in; the same folder now uses 3.0 MB.
+
+**Rule worth keeping:** before any HTTP node, check how many items reach it.
 
 ### 4.1 ~~Drive calls are sequential~~ — CORRECTED, not a bottleneck
 Originally recorded as the dominant cost. Node-level timings from execution 18

@@ -615,3 +615,37 @@ API calls per cycle.
 **General rule:** before an HTTP node, check how many items reach it. Fan-in from
 a batch loop's done output is easy to miss and multiplies both traffic and memory
 by the item count.
+
+---
+
+## Execution 6 — 441 files, and the Poll Once fix confirmed
+
+```
+Matt Par - Tube Mastery and Monetization 3.0
+441 files · 16.29 GB · 183 seconds · 0 failures
+Drive: 6 sections, 441 files, 0 loose, 0 filenames with a path separator
+```
+
+Execution data across comparable runs:
+
+```
+exec 4 (253 files)   34.5 MB  success
+exec 5 (400+ files) 150.7 MB  FAILED
+exec 6 (441 files)    3.0 MB  success
+```
+
+50x smaller than the run that died, on more files. The completion message and
+sheet row both landed.
+
+### New finding: the job list accumulates per hash
+
+`Check Jobs` returned **1742 jobs** for a 441-file folder — roughly 4x the file
+count, because jobs accumulate across every re-run of the same link. At ~601
+bytes each that is ~1 MB per poll, and it is now the largest single contributor
+to execution data.
+
+Harmless at this size, but it grows monotonically with every resend. A link
+retried often enough will eventually recreate the memory problem `Poll Once`
+just solved. Recorded as roadmap 1.0; the fix is to poll the specific job ids
+returned by `Queue File` rather than the whole hash, which also closes the
+same-link concurrency defect.
