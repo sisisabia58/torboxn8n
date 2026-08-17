@@ -283,3 +283,37 @@ so a second transfer does not disturb the first.
 - Neither loop timeout guard has ever tripped.
 - The zip branch has never executed — this folder was 123 files against a
   threshold of 150.
+
+---
+
+## Phase timings from execution 18 (123 files, 89.7s)
+
+Node-level timings, which changed two assumptions.
+
+| Phase | Runs | Time | Note |
+| --- | --- | --- | --- |
+| `Queue File` | 13 | 21.1s | real API time, ~172ms/request |
+| `Throttle` | 13 | **39.0s** | our own deliberate waiting |
+| `Check Jobs` | 1 | 6.2s | one call returns every job |
+| `Create Section` | 11 | 8.6s | one per section |
+| `Find File` | **1** | 4.6s | all 123 items in a single node run |
+| `File Into Place` | **1** | 5.1s | all 123 items in a single node run |
+
+**The rate limit was never the constraint.** Queueing ran at ~122 req/min against
+TorBox's 300/min ceiling — 41% utilisation — because 39 of the 60 seconds spent
+queueing were our own throttle.
+
+**Drive filing is not sequential per file.** n8n processes every item within one
+node run, so filing 123 files cost ~10s, not the per-file cost assumed when the
+roadmap was written.
+
+### Changes made
+
+- `batchSize` 10 -> 25, throttle 3s -> 2s: ~238 req/min, a ~20% margin under the
+  ceiling.
+- Zip threshold 150 -> 1000. Per-file now covers any realistic folder; 1000 files
+  is roughly 4 minutes of queueing.
+- `MAX_JOB_POLLS` 180 -> 540 (3h), since a premature cap destroys a working large
+  transfer while a generous one only wastes wall clock on a stuck one.
+- Added a 429 backoff on `Queue File`'s error output, warranted now that
+  headroom is smaller.

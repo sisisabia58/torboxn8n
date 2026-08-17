@@ -44,7 +44,10 @@ SHEET_COLUMNS = ("timestamp", "telegram_user", "source_link", "folder_name",
 # Poll ceilings. Without these a loop runs until n8n's execution timeout, which
 # looks identical to "still working" from the outside.
 MAX_DOWNLOAD_POLLS = 120   # x30s = 1 hour
-MAX_JOB_POLLS = 180        # x20s = 1 hour
+# Raised from 180 (1h) to cover legitimately large transfers. A premature cap
+# destroys a working multi-hour transfer; a generous one only wastes wall clock
+# on a genuinely stuck run, which the guard still catches.
+MAX_JOB_POLLS = 540        # x20s = 3 hours
 
 
 def sheet_schema():
@@ -53,14 +56,18 @@ def sheet_schema():
              "defaultMatch": False, "display": True, "canBeUsedToMatch": True}
             for c in SHEET_COLUMNS]
 
-# Above this many files, upload one zip instead of one job per file, to stay
-# clear of TorBox's 300 requests/min limit.
+# Above this many files, upload one zip instead of one job per file.
 #
-# Batching submits ~200 requests/min, so 150 files is roughly 45s of queueing --
-# comfortably under the ceiling. Set low (30) at first, which would have turned
-# a real 72-file folder into a single 3 GB zip and made its videos unstreamable.
-# Zip is for genuinely huge folders, not ordinary ones.
-FILE_COUNT_THRESHOLD = 150
+# Measured on a real 123-file run: queueing spent 21.1s in the API and 39.0s in
+# our own throttle -- about 122 req/min against TorBox's 300/min ceiling, i.e.
+# 41% utilisation. The limit was never the binding constraint; the throttle was.
+# Retuned batching (25 per batch, 2s pause) runs at ~238/min, so 1000 files is
+# roughly 4 minutes of queueing.
+#
+# Zip is kept only as a safety valve for absurd folders. It has never executed
+# once (see docs/v2-roadmap.md 2.3), so raising this threshold makes an
+# unexercised path LESS likely to fire, which is the safer direction.
+FILE_COUNT_THRESHOLD = 1000
 
 # Credentials required, by n8n credential type -> credential NAME on the instance.
 # torBoxApi is intentionally absent: the workflow no longer uses the community
@@ -387,7 +394,7 @@ def build(creds):
         }),
 
         node("Batch Files", "n8n-nodes-base.splitInBatches", 3, [1760, 280],
-             {"batchSize": 10, "options": {"reset": False}}),
+             {"batchSize": 25, "options": {"reset": False}}),
 
         node("Queue File", "n8n-nodes-base.httpRequest", 4.2, [1980, 400], {
             "method": "POST",
@@ -405,12 +412,16 @@ def build(creds):
                         " type: 'webdownload', file_id: $json.file_id,"
                         " google_token: $('Mint Token').item.json.access_token }) }}",
             "options": {},
-        }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]},
+           {"onError": "continueErrorOutput"}),
 
-        # 10 per batch with a 3s pause is ~200 req/min, leaving headroom under
-        # the 300/min ceiling for the polling calls running alongside.
+        # 25 per batch with a 2s pause. At the measured 172ms/request that is
+        # ~4.3s of API plus 2s waiting per 25, or ~238 req/min -- a deliberate
+        # ~20% margin under the 300/min ceiling, leaving room for the job
+        # polling that runs alongside. The previous 10/3s ran at ~122/min,
+        # using only 41% of the allowance.
         node("Throttle", "n8n-nodes-base.wait", 1.1, [1980, 560],
-             {"resume": "timeInterval", "amount": 3, "unit": "seconds"},
+             {"resume": "timeInterval", "amount": 2, "unit": "seconds"},
              None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000002"}),
 
         # --- Task 7: poll jobs, then correct Drive placement -----------------
@@ -769,6 +780,42 @@ def build(creds):
         }, {"googleSheetsOAuth2Api": creds["googleSheetsOAuth2Api"]},
            {"onError": "continueRegularOutput"}),
 
+        # Running at ~238 req/min leaves less headroom than the old ~122, so a
+        # 429 is now plausible under concurrency. It is recoverable: wait and
+        # resume rather than failing a transfer that is otherwise fine.
+        node("Rate Limited?", "n8n-nodes-base.code", 2, [2200, 620], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "const e = $input.first().json || {};\n"
+                "const code = e.error?.httpCode || e.error?.statusCode\n"
+                "  || e.httpCode || e.statusCode;\n"
+                "const limited = String(code) === '429'\n"
+                "  || /too many requests/i.test(JSON.stringify(e));\n"
+                "return [{ json: { limited, original: e } }];",
+        }),
+
+        node("Is 429?", "n8n-nodes-base.if", 2.2, [2420, 620], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "loose", "version": 2},
+                "conditions": [{
+                    "id": "is-429",
+                    "leftValue": "={{ $json.limited }}",
+                    "rightValue": "",
+                    "operator": {"type": "boolean", "operation": "true",
+                                 "singleValue": True},
+                }],
+            },
+            "looseTypeValidation": True,
+            "options": {},
+        }),
+
+        node("Backoff 60s", "n8n-nodes-base.wait", 1.1, [2640, 720],
+             {"resume": "timeInterval", "amount": 60, "unit": "seconds"},
+             None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000004"}),
+
         # --- Task 9: bounded loops and a single failure path -----------------
         # Both poll loops were previously unbounded. A download whose files[]
         # never populates, or a job that never reaches a terminal status, would
@@ -919,7 +966,16 @@ def build(creds):
             [{"node": "Check Jobs", "type": "main", "index": 0}],
             [{"node": "Queue File", "type": "main", "index": 0}],
         ]},
-        "Queue File": {"main": [[{"node": "Throttle", "type": "main", "index": 0}]]},
+        "Queue File": {"main": [
+            [{"node": "Throttle", "type": "main", "index": 0}],
+            [{"node": "Rate Limited?", "type": "main", "index": 0}],  # error output
+        ]},
+        "Rate Limited?": {"main": [[{"node": "Is 429?", "type": "main", "index": 0}]]},
+        "Is 429?": {"main": [
+            [{"node": "Backoff 60s", "type": "main", "index": 0}],       # retry
+            [{"node": "Classify Failure", "type": "main", "index": 0}],  # real failure
+        ]},
+        "Backoff 60s": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
         "Throttle": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
 
         "Check Jobs": {"main": [[{"node": "This Run's Jobs", "type": "main", "index": 0}]]},

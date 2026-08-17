@@ -93,10 +93,10 @@ Not built. Failures are now visible and re-sending the link is a manual retry,
 but an automatic single re-queue would handle transient TorBox errors without
 user involvement.
 
-### 3.3 Explicit 429 backoff
-Not built. Throttling holds ~200 req/min against a 300/min ceiling, so this only
-matters under concurrency (see 1.1). A 429 currently surfaces as a visible
-failure rather than a retry.
+### 3.3 ~~Explicit 429 backoff~~ — DONE
+Built once throughput was raised from ~122 to ~238 req/min, which leaves less
+headroom. `Queue File`'s error output now routes through a 429 check to a 60s
+backoff that resumes the batch loop; anything else goes to the failure path.
 
 ### 3.4 Long transfers vs n8n's execution timeout
 The download cap is one hour. A genuinely large Mega folder could exceed both
@@ -107,10 +107,18 @@ to split the download wait into a resumable sub-workflow.
 
 ## Tier 4 — Performance
 
-### 4.1 Drive calls are sequential
-Filing is 2 API calls per file (find + patch), run one after another. 123 files
-took 88 seconds end to end, most of it here. Batching via Drive's batch endpoint,
-or parallelising in groups, would cut it substantially.
+### 4.1 ~~Drive calls are sequential~~ — CORRECTED, not a bottleneck
+Originally recorded as the dominant cost. Node-level timings from execution 18
+disprove it: `Find File` and `File Into Place` each ran **once** for all 123
+items, taking 4.6s and 5.1s. n8n batches items within a single node run, so
+filing is ~10s of a 90s transfer.
+
+The real cost was our own throttle — 39.0s of deliberate waiting against 21.1s
+of actual API time. Addressed by retuning batching (25 per batch, 2s pause)
+rather than by touching Drive at all.
+
+This entry is kept as a reminder that a plausible-sounding bottleneck should be
+measured before it is optimised.
 
 ### 4.2 Skip the lookup entirely
 If the upload could report its Drive file id, `Find File` disappears — halving
