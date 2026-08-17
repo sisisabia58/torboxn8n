@@ -649,3 +649,41 @@ retried often enough will eventually recreate the memory problem `Poll Once`
 just solved. Recorded as roadmap 1.0; the fix is to poll the specific job ids
 returned by `Queue File` rather than the whole hash, which also closes the
 same-link concurrency defect.
+
+---
+
+## Execution 7 — job-id filtering verified
+
+```
+Temlis - AI Website School
+100 files · 3.42 GB · 258 seconds · 0 failures · 0.4 MB execution data
+```
+
+The filter change behaved exactly as designed:
+
+```
+Poll Once        queued   = 100
+This Run's Jobs  mine     = 100
+                 expected = 100
+```
+
+Every queued job id matched, none missed, nothing extra. Selection is now exact
+by construction rather than inferred from a timestamp window, so two concurrent
+runs of the same link can no longer see each other's jobs.
+
+Drive verified independently: 8 sections, 99 files in sections, 1 file at the
+root, no filename retaining a path separator. The loose file is correct — it sits
+at the top level of the source folder, so the root is where it belongs.
+
+Execution data was 0.4 MB. Note this folder was new, so its hash carried only
+this run's 100 jobs; the accumulation described in roadmap 1.0 only appears on
+links transferred repeatedly.
+
+### Process note
+
+The edit that introduced this change asserted on two replacements and the second
+failed, so Python raised before writing the file. `Poll Once` silently kept its
+old code while `This Run's Jobs` was deployed referencing `job_ids` that did not
+exist — a runtime failure on the next transfer. Verifying the *stored* workflow
+after deploying caught it. "Deploy succeeded" is not evidence the intended change
+landed.
