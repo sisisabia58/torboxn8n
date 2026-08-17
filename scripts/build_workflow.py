@@ -37,6 +37,22 @@ DRIVE_FOLDER_ID = "1ERCHFMwp1jPVgFQPM4VPN4mlObA2pzwI"
 SHEET_ID = "15gN93Ly5x1XBXWrTjPsk6kMGtjF1IgVuf_jpIvBZez0"
 SHEET_TAB = "Sheet1"
 
+SHEET_COLUMNS = ("timestamp", "telegram_user", "source_link", "folder_name",
+                 "size_bytes", "file_count", "outcome", "stage", "error",
+                 "duration_sec")
+
+# Poll ceilings. Without these a loop runs until n8n's execution timeout, which
+# looks identical to "still working" from the outside.
+MAX_DOWNLOAD_POLLS = 120   # x30s = 1 hour
+MAX_JOB_POLLS = 180        # x20s = 1 hour
+
+
+def sheet_schema():
+    """The resourceMapper requires `schema` alongside `value`."""
+    return [{"id": c, "displayName": c, "type": "string", "required": False,
+             "defaultMatch": False, "display": True, "canBeUsedToMatch": True}
+            for c in SHEET_COLUMNS]
+
 # Above this many files, upload one zip instead of one job per file, to stay
 # clear of TorBox's 300 requests/min limit.
 #
@@ -230,7 +246,8 @@ def build(creds):
             ]},
             "options": {},
         }, {"httpHeaderAuth": creds["httpHeaderAuth"]},
-           {"retryOnFail": True, "maxTries": 3, "waitBetweenTries": 2000}),
+           {"retryOnFail": True, "maxTries": 3, "waitBetweenTries": 2000,
+            "onError": "continueErrorOutput"}),
 
         # Query string is built into the URL rather than via queryParameters so
         # this depends on no parameter names beyond method/url.
@@ -318,7 +335,7 @@ def build(creds):
                 {"name": "grant_type", "value": "refresh_token"},
             ]},
             "options": {},
-        }),
+        }, None, {"onError": "continueErrorOutput"}),
 
         # --- Task 6: fan-out decision and upload queueing --------------------
         node("Many Files?", "n8n-nodes-base.if", 2.2, [1320, 160], {
@@ -527,7 +544,7 @@ def build(creds):
                 "  || 'TorBox Transfer';\n"
                 "const sections = [...new Set(files.map(f => f.section).filter(Boolean))];\n"
                 "return [{ json: { root, sections, files, file_count: files.length } }];",
-        }),
+        }, None, {"onError": "continueErrorOutput"}),
 
         drive_http("Find Root", [3080, 20], "GET",
                    "={{ 'https://www.googleapis.com/drive/v3/files?q=' + "
@@ -718,14 +735,7 @@ def build(creds):
             "columns": {
                 "mappingMode": "defineBelow",
                 "matchingColumns": [],
-                "schema": [
-                    {"id": c, "displayName": c, "type": "string",
-                     "required": False, "defaultMatch": False,
-                     "display": True, "canBeUsedToMatch": True}
-                    for c in ("timestamp", "telegram_user", "source_link",
-                              "folder_name", "size_bytes", "file_count",
-                              "outcome", "stage", "error", "duration_sec")
-                ],
+                "schema": sheet_schema(),
                 "value": {
                     "timestamp": "={{ $now.toISO() }}",
                     "telegram_user":
@@ -744,6 +754,117 @@ def build(creds):
             "options": {},
         }, {"googleSheetsOAuth2Api": creds["googleSheetsOAuth2Api"]},
            {"onError": "continueRegularOutput"}),
+
+        # --- Task 9: bounded loops and a single failure path -----------------
+        # Both poll loops were previously unbounded. A download whose files[]
+        # never populates, or a job that never reaches a terminal status, would
+        # spin until n8n's execution timeout -- indistinguishable from progress.
+        node("Download Timeout?", "n8n-nodes-base.if", 2.2, [440, 380], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "loose", "version": 2},
+                "conditions": [{
+                    "id": "dl-cap",
+                    "leftValue": "={{ $runIndex }}",
+                    "rightValue": MAX_DOWNLOAD_POLLS,
+                    "operator": {"type": "number", "operation": "gte"},
+                }],
+            },
+            "looseTypeValidation": True,
+            "options": {},
+        }),
+
+        node("Jobs Timeout?", "n8n-nodes-base.if", 2.2, [1980, 620], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "loose", "version": 2},
+                "conditions": [{
+                    "id": "job-cap",
+                    "leftValue": "={{ $runIndex }}",
+                    "rightValue": MAX_JOB_POLLS,
+                    "operator": {"type": "number", "operation": "gte"},
+                }],
+            },
+            "looseTypeValidation": True,
+            "options": {},
+        }),
+
+        # Every failure route converges here so there is one place that decides
+        # what the user is told and what gets logged.
+        node("Classify Failure", "n8n-nodes-base.code", 2, [3740, 620], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// Inputs arrive from node error outputs and from timeout\n"
+                "// branches, so the shape varies. Normalise to {stage, reason}.\n"
+                "const j = $input.first().json || {};\n"
+                "const raw = JSON.stringify(j);\n"
+                "\n"
+                "let stage = 'unknown';\n"
+                "let reason = j.error?.message || j.message || j.detail\n"
+                "  || 'No detail provided.';\n"
+                "\n"
+                "// Cloudflare answers unfamiliar clients with an unstructured\n"
+                "// 1010 body. It reads like an auth failure and is not one.\n"
+                "if (raw.includes('error code: 1010')) {\n"
+                "  stage = 'cloudflare';\n"
+                "  reason = 'Blocked by Cloudflare (1010). The User-Agent header was "
+                "rejected \\u2014 this is NOT an API key problem.';\n"
+                "} else if (raw.includes('download_finished') || j.timeout === 'download') {\n"
+                "  stage = 'download';\n"
+                "} else if (raw.includes('access_token') || raw.includes('invalid_grant')) {\n"
+                "  stage = 'token';\n"
+                "} else if (raw.includes('integration/googledrive') || raw.includes('job')) {\n"
+                "  stage = 'upload';\n"
+                "}\n"
+                "\n"
+                "return [{ json: { stage, reason: String(reason).slice(0, 300) } }];",
+        }),
+
+        node("Report Failure", "n8n-nodes-base.telegram", 1.2, [3960, 620], {
+            "resource": "message", "operation": "editMessageText",
+            "messageType": "message",
+            "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+            "messageId": "={{ $('Ack').first().json.result.message_id }}",
+            "text": "={{ '\\u274c Transfer failed' }}\n\n"
+                    "Stage: {{ $json.stage }}\n"
+                    "{{ $json.reason }}\n"
+                    "updated {{ $now.toFormat('HH:mm:ss') }}",
+            "additionalFields": {},
+        }, tg, {"onError": "continueRegularOutput"}),
+
+        node("Log Failure", "n8n-nodes-base.googleSheets", 4.5, [4180, 620], {
+            "authentication": "oAuth2",
+            "resource": "sheet",
+            "operation": "append",
+            "documentId": {"__rl": True, "mode": "id", "value": SHEET_ID},
+            "sheetName": {"__rl": True, "mode": "name", "value": SHEET_TAB},
+            "columns": {
+                "mappingMode": "defineBelow",
+                "matchingColumns": [],
+                "schema": sheet_schema(),
+                "value": {
+                    "timestamp": "={{ $now.toISO() }}",
+                    "telegram_user":
+                        "={{ $('Telegram Trigger').first().json.message.from.username }}",
+                    "source_link":
+                        "={{ $('Telegram Trigger').first().json.message.text }}",
+                    "folder_name": "",
+                    "size_bytes": "",
+                    "file_count": "",
+                    "outcome": "failure",
+                    "stage": "={{ $('Classify Failure').first().json.stage }}",
+                    "error": "={{ $('Classify Failure').first().json.reason }}",
+                    "duration_sec":
+                        "={{ Math.round(($now.toMillis() - "
+                        "$('Telegram Trigger').first().json.message.date * 1000) / 1000) }}",
+                },
+            },
+            "options": {},
+        }, {"googleSheetsOAuth2Api": creds["googleSheetsOAuth2Api"]},
+           {"onError": "continueRegularOutput"}),
     ]
 
     connections = {
@@ -753,16 +874,26 @@ def build(creds):
             [{"node": "Reject", "type": "main", "index": 0}],    # false
         ]},
         "Ack": {"main": [[{"node": "Create Download", "type": "main", "index": 0}]]},
-        "Create Download": {"main": [[{"node": "Check Download", "type": "main", "index": 0}]]},
+        "Create Download": {"main": [
+            [{"node": "Check Download", "type": "main", "index": 0}],
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+        ]},
         "Check Download": {"main": [[{"node": "Download Done?", "type": "main", "index": 0}]]},
         "Download Done?": {"main": [
             [{"node": "Mint Token", "type": "main", "index": 0}],  # true
             [{"node": "Progress: Download", "type": "main", "index": 0}],
         ]},
         "Progress: Download": {"main": [[{"node": "Wait 30s", "type": "main", "index": 0}]]},
-        "Wait 30s": {"main": [[{"node": "Check Download", "type": "main", "index": 0}]]},
+        "Wait 30s": {"main": [[{"node": "Download Timeout?", "type": "main", "index": 0}]]},
+        "Download Timeout?": {"main": [
+            [{"node": "Classify Failure", "type": "main", "index": 0}],  # capped out
+            [{"node": "Check Download", "type": "main", "index": 0}],    # keep polling
+        ]},
 
-        "Mint Token": {"main": [[{"node": "Many Files?", "type": "main", "index": 0}]]},
+        "Mint Token": {"main": [
+            [{"node": "Many Files?", "type": "main", "index": 0}],
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+        ]},
         "Many Files?": {"main": [
             [{"node": "Queue Zip", "type": "main", "index": 0}],     # true  -> zip
             [{"node": "Expand Files", "type": "main", "index": 0}],  # false -> per file
@@ -785,10 +916,17 @@ def build(creds):
         ]},
         "Progress: Filing": {"main": [[{"node": "Plan Tree", "type": "main", "index": 0}]]},
         "Progress: Upload": {"main": [[{"node": "Wait Jobs 20s", "type": "main", "index": 0}]]},
-        "Wait Jobs 20s": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
+        "Wait Jobs 20s": {"main": [[{"node": "Jobs Timeout?", "type": "main", "index": 0}]]},
+        "Jobs Timeout?": {"main": [
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+            [{"node": "Check Jobs", "type": "main", "index": 0}],
+        ]},
 
         # Folder tree: find-or-create the root, then the sections beneath it.
-        "Plan Tree": {"main": [[{"node": "Find Root", "type": "main", "index": 0}]]},
+        "Plan Tree": {"main": [
+            [{"node": "Find Root", "type": "main", "index": 0}],
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+        ]},
         "Find Root": {"main": [[{"node": "Root Missing?", "type": "main", "index": 0}]]},
         "Root Missing?": {"main": [
             [{"node": "Create Root", "type": "main", "index": 0}],  # true  -> create
@@ -817,6 +955,8 @@ def build(creds):
         "File Into Place": {"main": [[{"node": "Summarize", "type": "main", "index": 0}]]},
         "Summarize": {"main": [[{"node": "Done", "type": "main", "index": 0}]]},
         "Done": {"main": [[{"node": "Log Success", "type": "main", "index": 0}]]},
+        "Classify Failure": {"main": [[{"node": "Report Failure", "type": "main", "index": 0}]]},
+        "Report Failure": {"main": [[{"node": "Log Failure", "type": "main", "index": 0}]]},
     }
 
     return {
