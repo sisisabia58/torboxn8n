@@ -367,3 +367,35 @@ usual causes.
 before discovering a condition that one call to `/user/me` would have revealed
 up front. Added `Check Account` → `Account OK?` ahead of `Create Download`,
 which fails fast and specifically on an active cooldown or an expired plan.
+
+---
+
+## Execution 24 — n8n truncates thrown error messages at colons
+
+The new pre-flight fired correctly and stopped the run before any download. But
+the message reaching Telegram was mangled:
+
+```
+thrown:    "TorBox account is in cooldown for another 22.9h
+            (until 2026-08-18T06:49:50Z). Downloads would succeed but ..."
+n8n error: "50Z). Downloads would succeed but every upload fails."
+```
+
+**n8n splits a thrown error message on `:` and keeps only the last segment.** The
+ISO timestamp in the text (`T06:49:50Z`) destroyed everything before it. The
+surviving fragment then matched no classifier pattern, so the stage stayed
+`unknown` — a second symptom of the same cause.
+
+### Fix: stop passing failure information through a string
+
+`Account OK?` no longer throws. It returns a structured verdict
+(`{ok, stage, reason}`) and a new `Account Gate` IF routes on `ok`.
+`Classify Failure` now passes through any input that already carries its own
+`stage` and `reason`, only falling back to string parsing for genuine node
+errors.
+
+Structured fields cannot be mangled by error-message formatting. Any future
+check that knows why it failed should report it this way rather than throwing.
+
+**General rule:** avoid colons in thrown n8n error messages, and prefer a
+structured verdict over an exception wherever the caller can route on it.

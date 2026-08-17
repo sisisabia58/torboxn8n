@@ -251,29 +251,49 @@ def build(creds):
             "mode": "runOnceForAllItems",
             "language": "javaScript",
             "jsCode":
-                "// Fail fast and specifically. Both of these present downstream\n"
-                "// as 'Failed to get file for upload', which reads like a\n"
-                "// transient TorBox glitch rather than an account problem.\n"
+                "// Returns a verdict; never throws. n8n splits a thrown message on\n"
+                "// ':' and keeps only the final segment, so an ISO timestamp in the\n"
+                "// text silently destroys it -- on execution 24 the whole reason\n"
+                "// collapsed to \"50Z). Downloads would...\". Structured fields\n"
+                "// survive where a string does not.\n"
                 "const d = ($input.first().json || {}).data || {};\n"
                 "const now = Date.now();\n"
                 "\n"
                 "const cooldown = d.cooldown_until ? Date.parse(d.cooldown_until) : 0;\n"
                 "if (cooldown && cooldown > now) {\n"
                 "  const hrs = ((cooldown - now) / 3600000).toFixed(1);\n"
-                "  throw new Error('TorBox account is in cooldown for another '\n"
-                "    + hrs + 'h (until ' + d.cooldown_until + '). Downloads would "
-                "succeed but every upload fails.');\n"
+                "  return [{ json: { ok: false, stage: 'torbox-cooldown',\n"
+                "    reason: 'TorBox account is in cooldown for another ' + hrs\n"
+                "      + ' hours. Downloads still work, but every upload fails until'\n"
+                "      + ' it clears. Nothing to fix in the workflow.' } }];\n"
                 "}\n"
                 "\n"
                 "const premium = d.premium_expires_at ? Date.parse(d.premium_expires_at) : 0;\n"
                 "if (premium && premium < now) {\n"
-                "  throw new Error('TorBox premium expired on ' + d.premium_expires_at\n"
-                "    + '. Web downloads require a paid plan.');\n"
+                "  return [{ json: { ok: false, stage: 'torbox-plan',\n"
+                "    reason: 'TorBox premium has expired. Web downloads need a paid'\n"
+                "      + ' plan.' } }];\n"
                 "}\n"
                 "\n"
-                "return [{ json: { ok: true, plan: d.plan,\n"
-                "  premium_expires_at: d.premium_expires_at } }];",
-        }, None, {"onError": "continueErrorOutput"}),
+                "return [{ json: { ok: true, plan: d.plan } }];",
+        }),
+
+        node("Account Gate", "n8n-nodes-base.if", 2.2, [660, 20], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "loose", "version": 2},
+                "conditions": [{
+                    "id": "acct-ok",
+                    "leftValue": "={{ $json.ok }}",
+                    "rightValue": "",
+                    "operator": {"type": "boolean", "operation": "true",
+                                 "singleValue": True},
+                }],
+            },
+            "looseTypeValidation": True,
+            "options": {},
+        }),
 
         # Deliberately NOT the n8n-nodes-torbox community node: Railway wipes
         # ~/.n8n/nodes on every deploy, which silently prevents the workflow
@@ -913,6 +933,13 @@ def build(creds):
                 "const pick = (v) => (typeof v === 'string' && v) ? v\n"
                 "  : (v && typeof v === 'object' && v.message) ? v.message : null;\n"
                 "\n"
+                "// A caller that already knows its own stage and reason passes them\n"
+                "// straight through -- no string parsing, nothing for n8n to mangle.\n"
+                "if (j.stage && j.reason) {\n"
+                "  return [{ json: { stage: j.stage,\n"
+                "    reason: String(j.reason).slice(0, 300) } }];\n"
+                "}\n"
+                "\n"
                 "let stage = 'unknown';\n"
                 "let reason = pick(j.error) || pick(j.message) || pick(j.detail)\n"
                 "  || pick(j.error?.description) || 'No detail provided.';\n"
@@ -995,7 +1022,8 @@ def build(creds):
             [{"node": "Account OK?", "type": "main", "index": 0}],
             [{"node": "Classify Failure", "type": "main", "index": 0}],
         ]},
-        "Account OK?": {"main": [
+        "Account OK?": {"main": [[{"node": "Account Gate", "type": "main", "index": 0}]]},
+        "Account Gate": {"main": [
             [{"node": "Create Download", "type": "main", "index": 0}],
             [{"node": "Classify Failure", "type": "main", "index": 0}],
         ]},
