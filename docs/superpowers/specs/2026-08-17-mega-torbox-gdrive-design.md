@@ -180,10 +180,13 @@ capped at one per stage; there is no unbounded retry anywhere.
 
 **External prerequisites**
 - TorBox paid plan (web downloads are not available on free)
-- Google Cloud project with the Drive API enabled and an OAuth client of type
-  *Desktop app*. **One client covers both uses** — n8n's Drive credential for the
-  fix-up step and the `refresh_token` grant for minting upload tokens. They are
-  two credentials in n8n but need only one Google Cloud client.
+- Google Cloud project with the Drive API enabled and **two OAuth clients**:
+  - **Desktop app** — used by `scripts/google_oauth.py` for the loopback flow that
+    produces `GOOGLE_REFRESH_TOKEN` (minting upload tokens). Desktop clients only
+    permit `http://localhost` redirects.
+  - **Web application** — used by n8n's Google Drive and Sheets credentials, with
+    n8n's callback (`https://<your-n8n>/rest/oauth2-credential/callback`) added as
+    an authorized redirect URI. A Desktop client cannot serve this flow.
 - **Consent screen published.** While in Testing, Google expires refresh tokens
   after 7 days and the workflow dies weekly. This applies to n8n's own Drive
   credential too — it is not specific to the token-minting path.

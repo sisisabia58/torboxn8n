@@ -1,0 +1,285 @@
+# Verification log
+
+Evidence from real executions against live services. Recorded here because
+several findings are only observable at runtime and would otherwise be lost.
+
+Workflow: `Mega -> TorBox -> Drive` (n8n id `lXx9PnCwig2H2sQV`)
+
+---
+
+## Tasks 2–4 — executions 1–4 (2026-08-17)
+
+### Execution 1 — junk input
+Input `hello` → `Is Mega Link` false → `Reject`. Gate gets it right.
+
+### Execution 3 — bot command
+Input `/start` → rejected. Worth noting: `/start` is the first thing Telegram
+sends any new bot, so the reject path is hit before a user ever sends a link.
+
+### Execution 2 — cached link
+Input: the folder used during design probing.
+
+```
+Create Download → "Found cached web download. Using cached download."
+                  webdownload_id 1555206
+Check Download  → download_finished already true
+Download Done?  → true, exits immediately
+```
+
+**TorBox short-circuits a previously seen link.** The whole run took one second.
+A test that finishes suspiciously fast is probably this, not a broken loop.
+
+### Execution 4 — fresh link, the real test
+Input: an uncached Mega folder (`a2oylZTA`).
+
+```
+Create Download    → "Mega download started"
+Check Download r0  → finished=False progress=0 speed=0
+Download Done?  r0 → false
+Progress: Download → edited message_id 8
+Wait 30s           → resumed
+Check Download r1  → finished=True progress=1
+Download Done?  r1 → true, exits
+```
+
+Duration 34s.
+
+**Rendered Telegram text on the first poll:**
+
+```
+Anneke Odendaal - 100 Reel Ideas
+
+Downloading from Mega: 0.0%
+measuring speed...
+```
+
+Findings:
+
+- **`$runIndex` persists across `Wait` resumptions.** This was genuinely uncertain.
+  It is what suppresses TorBox's nonsense first-poll reading (~258 B/s, ETA ~180
+  days) before the transfer ramps. Had it reset, every run would open by telling
+  the user their download finishes in half a year.
+- **`bypass_cache` is nested correctly** — run1 returned fresh state rather than a
+  stale `finished=False`, which would have spun the loop forever.
+- **`$('Ack').item.json.result.message_id` is the correct path.** Telegram returns
+  `{"ok": true, "result": {"message_id": N}}`.
+- **Progress edits land in place**, so the chat stays one live status line.
+
+Not yet exercised: the multi-iteration loop. This download finished in a single
+cycle, so the `$runIndex >= 1` branch that renders MB/s has never rendered.
+
+---
+
+## Infrastructure findings (Railway + Postgres, 2026-08-17)
+
+Three failures during deployment, none of them workflow logic. Recorded because
+each presented as something other than its cause.
+
+### Community node vanished
+`n8n-nodes-torbox` disappeared from the instance mid-session. Symptom: the
+Telegram bot stopped responding entirely, with no error visible to the user.
+Cause: n8n could not activate the workflow (`Unrecognized node type:
+n8n-nodes-torbox.torBox`), so it never registered the Telegram webhook.
+
+Confirmed independently: creating a `torBoxApi` credential succeeded earlier in
+the session and later failed with `req.body.type is not a known type`.
+
+Resolved by removing the dependency — both operations are plain HTTP calls.
+
+### Encryption key changed once
+Symptom: `Credentials could not be decrypted. The likely reason is that a
+different "encryptionKey" was used`.
+
+Initially misdiagnosed as the key rotating on every deploy. A volume **is**
+mounted at `/home/node/.n8n`, so the key does persist. Testing showed a
+newly created credential activates fine, so the current key is stable — the
+key changed **once**, most plausibly when the volume was first attached and
+masked the pre-existing `.n8n` directory.
+
+Consequence: credentials created before that event are permanently unreadable
+and must be recreated. Credentials created after are fine.
+
+### $env blocked, Variables licensed
+`n8n Variables` is a licensed feature (403 on community edition), and `$env`
+was blocked by `N8N_BLOCK_ENV_ACCESS_IN_NODE` in both Code-node and expression
+contexts. Verified with a throwaway probe workflow rather than by burning a
+download run.
+
+Note that setting `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` exposes every
+environment variable — including `N8N_ENCRYPTION_KEY` — to every workflow on
+the instance.
+
+---
+
+## Tasks 5-7, first execution (exec 11)
+
+Reached `Mint Token` and beyond for the first time.
+
+Worked: `Mint Token` returned a real 253-char token with `scope=drive`, proving
+`$env` resolves in the live pipeline. `Many Files?` evaluated and branched.
+
+### Bug: TorBox sets download_finished before populating files[]
+
+The run ended at `Expand Files` having emitted zero items, and reported
+**success**. Polls showed:
+
+```
+run3: finished=False progress=0.94  files=0
+run4: finished=True  progress=1     files=0
+```
+
+Queried directly a few minutes later, the same download had **72 files**.
+
+So `download_finished` flips before `files[]` is filled. Gating on the flag
+alone let the workflow proceed with an empty list: `Expand Files` mapped over
+`[]`, emitted nothing, downstream nodes never ran, and the execution finished
+green with nothing uploaded.
+
+This also silently corrupted the fan-out decision — `Many Files?` compared
+`0 > 30` and chose per-file for what is really a 72-file folder.
+
+**Fix:** `Download Done?` now requires `download_finished === true` AND
+`files.length > 0`.
+
+**Note:** a green execution is not evidence of a completed transfer. This one
+did nothing at all and looked identical to success.
+
+### Threshold raised 30 -> 150
+
+30 was set before any real folder was measured. At 30, a routine 72-file folder
+would collapse into a single 3 GB zip, making its videos unstreamable in Drive.
+Batching submits ~200 req/min against a 300/min ceiling, so 150 files is ~45s of
+queueing. Zip is now reserved for genuinely huge folders.
+
+### Open risk
+
+The poll loop still has no stall guard (Task 9). If `files[]` never populates,
+the loop runs until n8n's execution timeout rather than reporting a failure.
+
+---
+
+## Execution 12 — the upload path works; progress reporting killed the run
+
+With the `files[]` gate fixed and the download cached, this run reached every
+remaining node.
+
+**Verified independently against the Drive API, not from execution status:**
+
+| Check | Result |
+| --- | --- |
+| Files from this run in the target folder | 72 / 72 |
+| Correctly parented (not orphaned) | 72 / 72 |
+| Renamed to clean basenames | 72 / 72 |
+
+So the Drive fix-up — search, rename, move — works. It had been my predicted
+failure point; that prediction was wrong.
+
+### But the execution reported `error`
+
+```
+Progress: Upload
+Bad Request: message is not modified: specified new message content and
+reply markup are exactly the same as a current content
+```
+
+Telegram refuses an edit whose text is byte-identical to the current message.
+With 72 files, two consecutive polls rendered the same completed-count and the
+same rounded percentage, so the edit was a no-op and returned HTTP 400.
+
+**A cosmetic progress update aborted a transfer that had already fully
+succeeded.** Files were in place; the run still ended in error and never
+reported completion.
+
+**Fix, two layers:**
+- Every progress message now ends with `updated HH:mm:ss`, so no two edits are
+  ever identical.
+- Both progress nodes carry `onError: continueRegularOutput`. Display failures
+  must not be able to abort the pipeline.
+
+### Basename collisions
+
+Three files named `Read me.txt` arrived from different subfolders of the same
+Mega folder. Renaming to `split('/').pop()` collapses distinct paths into
+identical names in one flat Drive folder. Drive permits duplicates so nothing
+failed, but the files are no longer distinguishable. Worth prefixing with the
+parent segment if this matters.
+
+### Note on counting
+
+The folder listed 75 files, not 72. Three were leftovers from earlier manual
+probing, with the old flattened names. Checking `createdTime` separated them
+cleanly — raw counts alone would have misread this as the workflow duplicating
+work.
+
+---
+
+## Execution 17 — folder tree works; reporting silently failed
+
+The two-level mirror produced exactly the intended structure: 72/72 files in
+9 section folders under a root named after the source, no loose files at the
+destination top level, and no filename still containing a path separator. The
+three `Read me.txt` files landed in different sections, ending the collision.
+
+But the chat stopped at "Filing 72 files..." and no sheet row appeared, while
+the execution reported **success**. Both completion nodes had failed and been
+swallowed by `onError: continueRegularOutput`:
+
+```
+Done        -> Paired item data for item from node 'Build Map' is unavailable
+Log Success -> `columns.schema` is required when `columns.mappingMode` is `defineBelow`
+```
+
+- `Done` used `$('Telegram Trigger').item`, but `Summarize` collapses 72 items
+  into one, severing the paired-item chain `.item` depends on. `.first()` is
+  correct after any fan-in.
+- The Sheets resourceMapper requires a `schema` array alongside `value`.
+
+### The tradeoff this exposes
+
+`onError: continueRegularOutput` was added deliberately so a reporting failure
+could not abort a completed transfer — and it did that. The cost is that those
+failures became invisible: the run looked green while two nodes were broken.
+
+Robustness and observability pulled in opposite directions here. The resolution
+is Task 9's error path, which is not yet built: failures suppressed by onError
+still need to surface somewhere.
+
+### Note
+
+`Progress: Filing` sits between the job list and the tree builder, and a
+Telegram node emits the Telegram API response rather than passing its input
+through. Any node reading `$input` after it gets the wrong payload. Downstream
+Code nodes now address their source node by name instead.
+
+---
+
+## Execution 18 — full pipeline verified end to end
+
+A different and larger source folder than earlier tests.
+
+```
+Write Build Scale - Substack System
+123 files · 3.45 GB · 88 seconds · 0 failures
+```
+
+Every node ran, from `Telegram Trigger` through `Done` and `Log Success`:
+
+- Completion message succeeded: `{"ok": true, "message_id": 30}` — a real
+  success, not an error silenced by `onError`, which is how the same node
+  presented on execution 17.
+- Sheet row written: `success | complete | 123 | 3447422669`.
+- Drive tree correct: 11 sections, 123 files, **0** loose files at the root,
+  **0** filenames still containing a path separator.
+
+Both previously transferred folders remain correctly structured side by side,
+so a second transfer does not disturb the first.
+
+**Task 8 verified.** Tasks 1–8 are now confirmed against live services.
+
+### Still unexercised
+
+- The failure path (`Classify Failure` → `Report Failure` → `Log Failure`) has
+  never run. It is deployed but unproven.
+- Neither loop timeout guard has ever tripped.
+- The zip branch has never executed — this folder was 123 files against a
+  threshold of 150.
