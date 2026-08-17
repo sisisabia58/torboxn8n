@@ -441,3 +441,49 @@ carries `cooldown_hours` through as information.
 **Lesson:** one account's correlation is not a mechanism. The trial's uploads
 probably failed for a plan-tier reason that happened to coexist with a cooldown
 timestamp.
+
+---
+
+## Executions 27 & 28 — Google Drive rate limit, and a crash
+
+### 27: the whole pipeline ran, then Drive refused the burst
+
+Every node executed — account check, download, 253 uploads, the full folder
+tree — and it died on the very last step:
+
+```
+File Into Place -> "Forbidden - perhaps check your credentials?"
+description:       "User rate limit exceeded."
+```
+
+Not a credential problem despite the message. **Google rate-limited us.**
+
+This is the direct cost of the thing recorded as a win after execution 18:
+`Find File` and `File Into Place` each process every item in ONE node run. That
+made 123 files fast; it also means 253 PATCH requests fired back-to-back with no
+pacing at all. The ceiling sits somewhere between 123 and 253.
+
+**Fix:** the Drive phase now runs through `Drive Batch` (50 per batch) with a 3s
+`Drive Throttle`, mirroring the TorBox queueing pattern, and both Drive nodes
+carry `retryOnFail` with a 5s wait — Google documents retry-with-backoff as the
+correct response to this error. Batching keeps us under the limit; retry catches
+what slips through.
+
+`Summarize` now counts from `Plan Tree` rather than `$input`, since with batching
+the last batch is all it would otherwise see.
+
+### 28: crashed, not failed
+
+Status `crashed`, last node `This Run's Jobs`, with
+`{"isArtificialRecoveredEventItem": true}` — n8n's marker for state reconstructed
+after the process died mid-execution. That is infrastructure, not workflow logic:
+a Railway restart or an out-of-memory kill while holding 253 items.
+
+Worth watching. If it recurs on large folders, memory during the fan-out is the
+first thing to check.
+
+### Note on the account
+
+`Account OK?` returned `ok: true, plan: 1, cooldown_hours: 23.9` — confirming the
+corrected pre-flight lets a healthy paid account through while still reporting
+the cooldown value for information.

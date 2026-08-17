@@ -172,8 +172,12 @@ def drive_http(name, pos, method, url_expr, body_expr=None):
             "specifyBody": "json",
             "jsonBody": body_expr,
         })
+    # Google answers a burst with 403 "User rate limit exceeded" and documents
+    # retry-with-backoff as the correct response. Batching keeps us under the
+    # limit; this catches what still slips through.
     return node(name, "n8n-nodes-base.httpRequest", 4.2, pos, params,
-                None, {"alwaysOutputData": True})
+                None, {"alwaysOutputData": True, "retryOnFail": True,
+                       "maxTries": 4, "waitBetweenTries": 5000})
 
 
 def node(name, ntype, tv, pos, params, creds=None, extra=None):
@@ -733,6 +737,17 @@ def build(creds):
                    "\"' in parents and mimeType='" + FOLDER_MIME + "' and trashed=false\") + "
                    "'&pageSize=200&fields=files(id,name)' }}"),
 
+        # Google rate-limits bursts per user. Find File and File Into Place each
+        # process every item in ONE node run, so a 253-file folder fired 253
+        # PATCHes back-to-back and drew "User rate limit exceeded" (execution 27).
+        # 72 and 123 files had been fine -- the ceiling sits between.
+        node("Drive Batch", "n8n-nodes-base.splitInBatches", 3, [5610, 120],
+             {"batchSize": 50, "options": {"reset": False}}),
+
+        node("Drive Throttle", "n8n-nodes-base.wait", 1.1, [6050, 220],
+             {"resume": "timeInterval", "amount": 3, "unit": "seconds"},
+             None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000005"}),
+
         node("Build Map", "n8n-nodes-base.code", 2, [5500, 20], {
             "mode": "runOnceForAllItems",
             "language": "javaScript",
@@ -1122,9 +1137,15 @@ def build(creds):
 
         # Per-file placement: locate the upload, then rename+reparent in one call.
         "List Sections Final": {"main": [[{"node": "Build Map", "type": "main", "index": 0}]]},
-        "Build Map": {"main": [[{"node": "Find File", "type": "main", "index": 0}]]},
+        "Build Map": {"main": [[{"node": "Drive Batch", "type": "main", "index": 0}]]},
+        # splitInBatches outputs are ordered [done, loop]
+        "Drive Batch": {"main": [
+            [{"node": "Summarize", "type": "main", "index": 0}],
+            [{"node": "Find File", "type": "main", "index": 0}],
+        ]},
         "Find File": {"main": [[{"node": "File Into Place", "type": "main", "index": 0}]]},
-        "File Into Place": {"main": [[{"node": "Summarize", "type": "main", "index": 0}]]},
+        "File Into Place": {"main": [[{"node": "Drive Throttle", "type": "main", "index": 0}]]},
+        "Drive Throttle": {"main": [[{"node": "Drive Batch", "type": "main", "index": 0}]]},
         "Summarize": {"main": [[{"node": "Done", "type": "main", "index": 0}]]},
         "Done": {"main": [[{"node": "Log Success", "type": "main", "index": 0}]]},
         "Classify Failure": {"main": [[{"node": "Report Failure", "type": "main", "index": 0}]]},
