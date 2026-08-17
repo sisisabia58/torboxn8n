@@ -20,12 +20,20 @@ It is not yet a problem: the 441-file run used 3.0 MB total. But it grows
 monotonically with every resend, so a frequently retried link will eventually
 recreate the memory failure that `Poll Once` just fixed.
 
-**Fix:** poll the specific `job_id`s returned by `Queue File` via
-`GET /integration/job/{id}` instead of fetching the whole hash. That also closes
-defect 1.1, which needs the same job-id tracking.
-**Effort:** medium · **Risk:** medium — replaces the polling mechanism.
+**Not fixed by the 1.1 change, and worth being clear why.** Filtering by job id
+makes selection exact but cannot shrink the response — the API offers no way to
+request a subset, so the full list still arrives and is still retained per poll.
 
-### 1.1 Same-link concurrency
+Polling ids individually via `GET /integration/job/{id}` was considered and
+rejected: that is one request *per job*, so a 441-file folder would make 441
+calls per poll cycle instead of one, blowing the 300 req/min limit outright.
+
+**The only real fix is deleting jobs** once a run completes, via
+`DELETE /integration/job/{id}`. That costs one request per job, but once per
+transfer rather than once per poll. Worth doing when the list gets large enough
+to matter; at 1742 jobs / ~1 MB it does not yet.
+
+### 1.1 ~~Same-link concurrency~~ — FIXED
 `This Run's Jobs` filters by `created_at >= <telegram message time>`. Two runs of
 the **same** link share a TorBox hash, so the earlier run's cutoff also matches
 the later run's jobs: it waits on them, then tries to file another run's files
@@ -33,9 +41,11 @@ into its own tree.
 
 Different links are unaffected — job polling is scoped per hash.
 
-**Fix:** filter by the `job_id`s `Queue File` actually returned this run. Exact
-instead of heuristic, immune to overlap.
-**Effort:** small · **Risk:** touches the critical path, needs a verification run.
+**Fixed:** `Poll Once` now captures the `job_id`s the queue step returned (the
+batch loop's done output already carries every `Queue File` response), and
+`This Run's Jobs` filters on that id set. Exact by construction and immune to
+overlap. It also fails loudly if none of the ids have appeared yet, rather than
+proceeding with an empty set.
 
 ### 1.2 Folder creation is not atomic
 Find-or-create is two calls. Two concurrent runs sharing a root folder name can

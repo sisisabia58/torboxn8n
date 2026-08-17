@@ -503,7 +503,17 @@ def build(creds):
         node("Poll Once", "n8n-nodes-base.code", 2, [2090, 160], {
             "mode": "runOnceForAllItems",
             "language": "javaScript",
-            "jsCode": "return [{ json: { poll: true } }];",
+            "jsCode":
+                "// Capture this run's job ids. The batch loop's done output already\n"
+                "// carries every Queue File response, and the zip branch delivers a\n"
+                "// single one, so both arrive here with no extra plumbing.\n"
+                "const ids = $input.all()\n"
+                "  .map(i => i.json && i.json.data && i.json.data.job_id)\n"
+                "  .filter(v => v !== undefined && v !== null);\n"
+                "if (!ids.length) {\n"
+                "  throw new Error('No job ids captured from the queue step');\n"
+                "}\n"
+                "return [{ json: { job_ids: ids, queued: ids.length } }];",
         }),
 
         # One call returns every job for the hash, so polling cost is constant
@@ -529,16 +539,24 @@ def build(creds):
             "mode": "runOnceForAllItems",
             "language": "javaScript",
             "jsCode":
-                "const startedMs = $('Telegram Trigger').first().json.message.date * 1000;\n"
+                "// Exact by construction: these are the ids the queue step returned\n"
+                "// this run. The previous filter used created_at >= the Telegram\n"
+                "// message time, which ALSO matched a later concurrent run of the\n"
+                "// same link -- same hash, earlier cutoff -- so an overlapping run\n"
+                "// would wait on the other run's jobs and try to file its files.\n"
+                "const want = new Set($('Poll Once').first().json.job_ids);\n"
                 "const all = $input.first().json.data || [];\n"
-                "const mine = all.filter(j => {\n"
-                "  const t = Date.parse(j.created_at);\n"
-                "  return Number.isFinite(t) && t >= startedMs;\n"
-                "});\n"
-                "// Fall back to the full list rather than emitting nothing if\n"
-                "// timestamps are unparseable -- doing extra work beats doing none.\n"
-                "return [{ json: { data: mine.length ? mine : all } }];",
-        }),
+                "const mine = all.filter(j => want.has(j.id));\n"
+                "\n"
+                "// A job can take a moment to appear in the list. Throwing here\n"
+                "// routes to the failure path rather than silently proceeding with\n"
+                "// an empty set, which is how the files[] race hid once already.\n"
+                "if (!mine.length) {\n"
+                "  throw new Error('None of this run\\u2019s ' + want.size\n"
+                "    + ' job ids appear in the job list yet');\n"
+                "}\n"
+                "return [{ json: { data: mine, expected: want.size } }];",
+        }, None, {"onError": "continueErrorOutput"}),
 
         node("All Jobs Done?", "n8n-nodes-base.if", 2.2, [2420, 160], {
             "conditions": {
@@ -1109,7 +1127,10 @@ def build(creds):
         "Throttle": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
 
         "Check Jobs": {"main": [[{"node": "This Run's Jobs", "type": "main", "index": 0}]]},
-        "This Run's Jobs": {"main": [[{"node": "All Jobs Done?", "type": "main", "index": 0}]]},
+        "This Run's Jobs": {"main": [
+            [{"node": "All Jobs Done?", "type": "main", "index": 0}],
+            [{"node": "Classify Failure", "type": "main", "index": 0}],
+        ]},
         "All Jobs Done?": {"main": [
             [{"node": "Progress: Filing", "type": "main", "index": 0}],  # true
             [{"node": "Progress: Upload", "type": "main", "index": 0}],  # false
