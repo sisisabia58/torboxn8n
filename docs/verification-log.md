@@ -210,3 +210,43 @@ The folder listed 75 files, not 72. Three were leftovers from earlier manual
 probing, with the old flattened names. Checking `createdTime` separated them
 cleanly — raw counts alone would have misread this as the workflow duplicating
 work.
+
+---
+
+## Execution 17 — folder tree works; reporting silently failed
+
+The two-level mirror produced exactly the intended structure: 72/72 files in
+9 section folders under a root named after the source, no loose files at the
+destination top level, and no filename still containing a path separator. The
+three `Read me.txt` files landed in different sections, ending the collision.
+
+But the chat stopped at "Filing 72 files..." and no sheet row appeared, while
+the execution reported **success**. Both completion nodes had failed and been
+swallowed by `onError: continueRegularOutput`:
+
+```
+Done        -> Paired item data for item from node 'Build Map' is unavailable
+Log Success -> `columns.schema` is required when `columns.mappingMode` is `defineBelow`
+```
+
+- `Done` used `$('Telegram Trigger').item`, but `Summarize` collapses 72 items
+  into one, severing the paired-item chain `.item` depends on. `.first()` is
+  correct after any fan-in.
+- The Sheets resourceMapper requires a `schema` array alongside `value`.
+
+### The tradeoff this exposes
+
+`onError: continueRegularOutput` was added deliberately so a reporting failure
+could not abort a completed transfer — and it did that. The cost is that those
+failures became invisible: the run looked green while two nodes were broken.
+
+Robustness and observability pulled in opposite directions here. The resolution
+is Task 9's error path, which is not yet built: failures suppressed by onError
+still need to surface somewhere.
+
+### Note
+
+`Progress: Filing` sits between the job list and the tree builder, and a
+Telegram node emits the Telegram API response rather than passing its input
+through. Any node reading `$input` after it gets the wrong payload. Downstream
+Code nodes now address their source node by name instead.

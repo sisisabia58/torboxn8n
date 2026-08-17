@@ -648,18 +648,27 @@ def build(creds):
                 "} }));",
         }),
 
+        # Newest first: re-running a link leaves older uploads with the same
+        # flattened name, and an unordered search would pick one arbitrarily.
         drive_http("Find File", [5720, 20], "GET",
                    "={{ 'https://www.googleapis.com/drive/v3/files?q=' + "
                    "encodeURIComponent(\"name='\" + $json.file_name.replace(/'/g, \"\\\\'\") + "
-                   "\"' and trashed=false\") + '&fields=files(id,name,parents)' }}"),
+                   "\"' and trashed=false\") + "
+                   "'&orderBy=createdTime desc&pageSize=5&fields=files(id,name,parents)' }}"),
 
-        # Rename and reparent in a single PATCH. The Google Drive node splits
-        # these into two operations costing three API calls per file; this is
-        # one. Uploads arrive orphaned, so there is nothing to removeParents.
+        # Rename and reparent in a single PATCH -- the Google Drive node splits
+        # these into two operations costing three API calls per file.
+        #
+        # removeParents is required, not optional: TorBox now honours its own
+        # folder-ID setting and uploads land INSIDE the destination folder
+        # rather than orphaned. Drive enforces a single parent, so adding one
+        # without removing the current parent does not move the file.
         drive_http("File Into Place", [5940, 20], "PATCH",
                    "={{ 'https://www.googleapis.com/drive/v3/files/' + "
                    "(($json.files || [])[0] || {}).id + '?addParents=' + "
-                   "$('Build Map').item.json.target + '&fields=id,name,parents' }}",
+                   "$('Build Map').item.json.target + '&removeParents=' + "
+                   "encodeURIComponent(((($json.files || [])[0] || {}).parents || []).join(',')) + "
+                   "'&fields=id,name,parents' }}",
                    "={{ JSON.stringify({ name: $('Build Map').item.json.final_name }) }}"),
 
         # --- Task 8: report and log ------------------------------------------
@@ -682,11 +691,14 @@ def build(creds):
                 "} }];",
         }),
 
+        # Uses .first() rather than .item: Summarize collapses 72 items into
+        # one, which severs the paired-item chain that .item relies on.
+        # With .item this fails with "Paired item data ... is unavailable".
         node("Done", "n8n-nodes-base.telegram", 1.2, [3740, 160], {
             "resource": "message", "operation": "editMessageText",
             "messageType": "message",
-            "chatId": chat_id,
-            "messageId": "={{ $('Ack').item.json.result.message_id }}",
+            "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+            "messageId": "={{ $('Ack').first().json.result.message_id }}",
             "text": "={{ '\\u2705 ' + $json.folder_name }}\n\n"
                     "{{ $json.moved }}/{{ $json.file_count }} files"
                     " · {{ ($json.size_bytes / 1073741824).toFixed(2) }} GB\n"
@@ -700,21 +712,33 @@ def build(creds):
             "operation": "append",
             "documentId": {"__rl": True, "mode": "id", "value": SHEET_ID},
             "sheetName": {"__rl": True, "mode": "name", "value": SHEET_TAB},
+            # The resourceMapper requires `schema` alongside `value`; without
+            # it the node fails with "`columns.schema` is required when
+            # `columns.mappingMode` is `defineBelow`".
             "columns": {
                 "mappingMode": "defineBelow",
+                "matchingColumns": [],
+                "schema": [
+                    {"id": c, "displayName": c, "type": "string",
+                     "required": False, "defaultMatch": False,
+                     "display": True, "canBeUsedToMatch": True}
+                    for c in ("timestamp", "telegram_user", "source_link",
+                              "folder_name", "size_bytes", "file_count",
+                              "outcome", "stage", "error", "duration_sec")
+                ],
                 "value": {
                     "timestamp": "={{ $now.toISO() }}",
                     "telegram_user":
                         "={{ $('Telegram Trigger').first().json.message.from.username }}",
                     "source_link":
                         "={{ $('Telegram Trigger').first().json.message.text }}",
-                    "folder_name": "={{ $('Summarize').item.json.folder_name }}",
-                    "size_bytes": "={{ $('Summarize').item.json.size_bytes }}",
-                    "file_count": "={{ $('Summarize').item.json.file_count }}",
+                    "folder_name": "={{ $('Summarize').first().json.folder_name }}",
+                    "size_bytes": "={{ $('Summarize').first().json.size_bytes }}",
+                    "file_count": "={{ $('Summarize').first().json.file_count }}",
                     "outcome": "success",
                     "stage": "complete",
                     "error": "",
-                    "duration_sec": "={{ $('Summarize').item.json.duration_sec }}",
+                    "duration_sec": "={{ $('Summarize').first().json.duration_sec }}",
                 },
             },
             "options": {},
