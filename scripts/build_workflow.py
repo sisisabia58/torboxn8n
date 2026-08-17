@@ -26,6 +26,14 @@ WORKFLOW_NAME = "Mega -> TorBox -> Drive"
 UA = "n8n-torbox-workflow/1.0"
 TORBOX_API = "https://api.torbox.app/v1/api"
 
+# Destination for the Drive fix-up (TorBox ignores its own folder-ID setting
+# and uploads land orphaned, so the workflow moves them here itself).
+DRIVE_FOLDER_ID = "1ERCHFMwp1jPVgFQPM4VPN4mlObA2pzwI"
+
+# Above this many files, upload one zip instead of one job per file, to stay
+# clear of TorBox's 300 requests/min limit.
+FILE_COUNT_THRESHOLD = 30
+
 # Credentials required, by n8n credential type -> credential NAME on the instance.
 REQUIRED_CREDS = {
     "torBoxApi": "TorBox API",
@@ -205,6 +213,202 @@ def build(creds):
         node("Wait 30s", "n8n-nodes-base.wait", 1.1, [660, 380],
              {"resume": "timeInterval", "amount": 30, "unit": "seconds"},
              None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000001"}),
+
+        # --- Task 5: mint a real Google access token -------------------------
+        # TorBox requires a genuine token in the request body; an empty value
+        # passes schema validation and then fails the job asynchronously.
+        # n8n community edition has no Variables feature, so these come from
+        # the host environment via $env.
+        node("Mint Token", "n8n-nodes-base.httpRequest", 4.2, [1100, 160], {
+            "method": "POST",
+            "url": "https://oauth2.googleapis.com/token",
+            "sendBody": True,
+            "contentType": "form-urlencoded",
+            "bodyParameters": {"parameters": [
+                {"name": "client_id", "value": "={{ $env.GOOGLE_CLIENT_ID }}"},
+                {"name": "client_secret", "value": "={{ $env.GOOGLE_CLIENT_SECRET }}"},
+                {"name": "refresh_token", "value": "={{ $env.GOOGLE_REFRESH_TOKEN }}"},
+                {"name": "grant_type", "value": "refresh_token"},
+            ]},
+            "options": {},
+        }),
+
+        # --- Task 6: fan-out decision and upload queueing --------------------
+        node("Many Files?", "n8n-nodes-base.if", 2.2, [1320, 160], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "strict", "version": 2},
+                "conditions": [{
+                    "id": "file-count",
+                    "leftValue": "={{ $('Check Download').item.json.data.files.length }}",
+                    "rightValue": FILE_COUNT_THRESHOLD,
+                    "operator": {"type": "number", "operation": "gt"},
+                }],
+            },
+            "looseTypeValidation": False,
+            "options": {},
+        }),
+
+        node("Queue Zip", "n8n-nodes-base.httpRequest", 4.2, [1540, 40], {
+            "method": "POST",
+            "url": TORBOX_API + "/integration/googledrive",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "sendBody": True,
+            "contentType": "json",
+            "specifyBody": "json",
+            "jsonBody": "={{ JSON.stringify({"
+                        " id: $('Create Download').item.json.data.webdownload_id,"
+                        " type: 'webdownload', zip: true,"
+                        " google_token: $('Mint Token').item.json.access_token }) }}",
+            "options": {},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
+
+        node("Expand Files", "n8n-nodes-base.code", 2, [1540, 280], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// One item per file so each gets its own upload job.\n"
+                "// The list lives on a nested property of another node's output,\n"
+                "// which Edit Fields cannot expand.\n"
+                "const files = $('Check Download').first().json.data.files;\n"
+                "return files.map(f => ({ json: {\n"
+                "  file_id: f.id,\n"
+                "  file_name: f.name || f.short_name,\n"
+                "} }));",
+        }),
+
+        node("Batch Files", "n8n-nodes-base.splitInBatches", 3, [1760, 280],
+             {"batchSize": 10, "options": {"reset": False}}),
+
+        node("Queue File", "n8n-nodes-base.httpRequest", 4.2, [1980, 400], {
+            "method": "POST",
+            "url": TORBOX_API + "/integration/googledrive",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "sendBody": True,
+            "contentType": "json",
+            "specifyBody": "json",
+            "jsonBody": "={{ JSON.stringify({"
+                        " id: $('Create Download').item.json.data.webdownload_id,"
+                        " type: 'webdownload', file_id: $json.file_id,"
+                        " google_token: $('Mint Token').item.json.access_token }) }}",
+            "options": {},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
+
+        # 10 per batch with a 3s pause is ~200 req/min, leaving headroom under
+        # the 300/min ceiling for the polling calls running alongside.
+        node("Throttle", "n8n-nodes-base.wait", 1.1, [1980, 560],
+             {"resume": "timeInterval", "amount": 3, "unit": "seconds"},
+             None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000002"}),
+
+        # --- Task 7: poll jobs, then correct Drive placement -----------------
+        # One call returns every job for the hash, so polling cost is constant
+        # whether the folder held 4 files or 400.
+        node("Check Jobs", "n8n-nodes-base.httpRequest", 4.2, [2200, 160], {
+            "method": "GET",
+            "url": "={{ '" + TORBOX_API + "/integration/jobs/' + "
+                   "$('Create Download').item.json.data.hash }}",
+            "authentication": "genericCredentialType",
+            "genericAuthType": "httpHeaderAuth",
+            "sendHeaders": True,
+            "specifyHeaders": "keypair",
+            "headerParameters": {"parameters": [{"name": "User-Agent", "value": UA}]},
+            "options": {},
+        }, {"httpHeaderAuth": creds["httpHeaderAuth"]}),
+
+        node("All Jobs Done?", "n8n-nodes-base.if", 2.2, [2420, 160], {
+            "conditions": {
+                "combinator": "and",
+                "options": {"caseSensitive": True, "leftValue": "",
+                            "typeValidation": "strict", "version": 2},
+                "conditions": [{
+                    "id": "jobs-terminal",
+                    "leftValue": "={{ $json.data.every(j => j.status === 'completed'"
+                                 " || j.status === 'failed') }}",
+                    "rightValue": "",
+                    "operator": {"type": "boolean", "operation": "true",
+                                 "singleValue": True},
+                }],
+            },
+            "looseTypeValidation": False,
+            "options": {},
+        }),
+
+        node("Progress: Upload", "n8n-nodes-base.telegram", 1.2, [2420, 400], {
+            "resource": "message", "operation": "editMessageText",
+            "messageType": "message",
+            "chatId": chat_id,
+            "messageId": "={{ $('Ack').item.json.result.message_id }}",
+            "text": "={{ $('Check Download').item.json.data.name }}\n\n"
+                    "Uploading to Drive: "
+                    "{{ $json.data.filter(j => j.status === 'completed').length }}"
+                    "/{{ $json.data.length }} files\n"
+                    "{{ Math.round($json.data.reduce((a, j) => a + (j.progress || 0), 0)"
+                    " / $json.data.length * 100) }}%",
+            "additionalFields": {},
+        }, tg),
+
+        node("Wait Jobs 20s", "n8n-nodes-base.wait", 1.1, [2200, 400],
+             {"resume": "timeInterval", "amount": 20, "unit": "seconds"},
+             None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000003"}),
+
+        node("Completed Jobs", "n8n-nodes-base.code", 2, [2640, 160], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode":
+                "// Emit one item per successful upload so the Drive fix-up runs\n"
+                "// per file. Failed jobs are handled on the error path.\n"
+                "const jobs = $input.first().json.data;\n"
+                "return jobs\n"
+                "  .filter(j => j.status === 'completed')\n"
+                "  .map(j => ({ json: {\n"
+                "    job_id: j.id,\n"
+                "    file_name: j.file_name,\n"
+                "    final_name: String(j.file_name || '').split('/').pop(),\n"
+                "  } }));",
+        }),
+
+        # TorBox uploads arrive orphaned, with the source path flattened into
+        # the filename. The next three nodes find, rename, and file them.
+        node("Find In Drive", "n8n-nodes-base.googleDrive", 3, [2860, 160], {
+            "authentication": "oAuth2",
+            "resource": "fileFolder",
+            "operation": "search",
+            "searchMethod": "query",
+            "queryString": "={{ \"name = '\" + $json.file_name.replace(/'/g, \"\\\\'\")"
+                           " + \"' and trashed = false\" }}",
+            "returnAll": False,
+            "limit": 5,
+            "filter": {"whatToSearch": "files", "includeTrashed": False},
+            "options": {},
+        }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
+
+        # file:update renames only -- it cannot move. Moving is a separate
+        # operation; see docs/node-schemas.md.
+        node("Rename File", "n8n-nodes-base.googleDrive", 3, [3080, 160], {
+            "authentication": "oAuth2",
+            "resource": "file",
+            "operation": "update",
+            "fileId": {"__rl": True, "mode": "id", "value": "={{ $json.id }}"},
+            "newUpdatedFileName": "={{ $('Completed Jobs').item.json.final_name }}",
+            "options": {},
+        }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
+
+        node("Move To Folder", "n8n-nodes-base.googleDrive", 3, [3300, 160], {
+            "authentication": "oAuth2",
+            "resource": "file",
+            "operation": "move",
+            "fileId": {"__rl": True, "mode": "id", "value": "={{ $json.id }}"},
+            "folderId": {"__rl": True, "mode": "id", "value": DRIVE_FOLDER_ID},
+        }, {"googleDriveOAuth2Api": creds["googleDriveOAuth2Api"]}),
     ]
 
     connections = {
@@ -217,11 +421,38 @@ def build(creds):
         "Create Download": {"main": [[{"node": "Check Download", "type": "main", "index": 0}]]},
         "Check Download": {"main": [[{"node": "Download Done?", "type": "main", "index": 0}]]},
         "Download Done?": {"main": [
-            [],                                                   # true -> Task 5 (later)
+            [{"node": "Mint Token", "type": "main", "index": 0}],  # true
             [{"node": "Progress: Download", "type": "main", "index": 0}],
         ]},
         "Progress: Download": {"main": [[{"node": "Wait 30s", "type": "main", "index": 0}]]},
         "Wait 30s": {"main": [[{"node": "Check Download", "type": "main", "index": 0}]]},
+
+        "Mint Token": {"main": [[{"node": "Many Files?", "type": "main", "index": 0}]]},
+        "Many Files?": {"main": [
+            [{"node": "Queue Zip", "type": "main", "index": 0}],     # true  -> zip
+            [{"node": "Expand Files", "type": "main", "index": 0}],  # false -> per file
+        ]},
+        "Queue Zip": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
+        "Expand Files": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
+        # splitInBatches outputs are ordered [done, loop]
+        "Batch Files": {"main": [
+            [{"node": "Check Jobs", "type": "main", "index": 0}],
+            [{"node": "Queue File", "type": "main", "index": 0}],
+        ]},
+        "Queue File": {"main": [[{"node": "Throttle", "type": "main", "index": 0}]]},
+        "Throttle": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
+
+        "Check Jobs": {"main": [[{"node": "All Jobs Done?", "type": "main", "index": 0}]]},
+        "All Jobs Done?": {"main": [
+            [{"node": "Completed Jobs", "type": "main", "index": 0}],   # true
+            [{"node": "Progress: Upload", "type": "main", "index": 0}],  # false
+        ]},
+        "Progress: Upload": {"main": [[{"node": "Wait Jobs 20s", "type": "main", "index": 0}]]},
+        "Wait Jobs 20s": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
+
+        "Completed Jobs": {"main": [[{"node": "Find In Drive", "type": "main", "index": 0}]]},
+        "Find In Drive": {"main": [[{"node": "Rename File", "type": "main", "index": 0}]]},
+        "Rename File": {"main": [[{"node": "Move To Folder", "type": "main", "index": 0}]]},
     }
 
     return {
