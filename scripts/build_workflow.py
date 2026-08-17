@@ -527,7 +527,11 @@ def build(creds):
                 "    + JSON.stringify(src).slice(0, 120));\n"
                 "}\n"
                 "const jobs = src.filter(j => j.status === 'completed');\n"
-                "if (!jobs.length) throw new Error('No completed jobs to file');\n"
+                "const failed = src.filter(j => j.status === 'failed');\n"
+                "if (!jobs.length) {\n"
+                "  throw new Error('All ' + src.length + ' uploads failed. First reason: '\n"
+                "    + ((failed[0] || {}).detail || 'none given'));\n"
+                "}\n"
                 "\n"
                 "const files = jobs.map(j => {\n"
                 "  const parts = String(j.file_name || '').split('/');\n"
@@ -543,7 +547,10 @@ def build(creds):
                 "  || $('Check Download').first().json.data.name\n"
                 "  || 'TorBox Transfer';\n"
                 "const sections = [...new Set(files.map(f => f.section).filter(Boolean))];\n"
-                "return [{ json: { root, sections, files, file_count: files.length } }];",
+                "return [{ json: { root, sections, files,\n"
+                "  file_count: files.length,\n"
+                "  failed_count: failed.length,\n"
+                "  failed_reason: (failed[0] || {}).detail || '' } }];",
         }, None, {"onError": "continueErrorOutput"}),
 
         drive_http("Find Root", [3080, 20], "GET",
@@ -705,6 +712,8 @@ def build(creds):
                 "  size_bytes: dl.size,\n"
                 "  file_count: (dl.files || []).length,\n"
                 "  duration_sec: Math.round((Date.now() - startedMs) / 1000),\n"
+                "  failed_count: $('Plan Tree').first().json.failed_count || 0,\n"
+                "  failed_reason: $('Plan Tree').first().json.failed_reason || '',\n"
                 "} }];",
         }),
 
@@ -719,7 +728,12 @@ def build(creds):
             "text": "={{ '\\u2705 ' + $json.folder_name }}\n\n"
                     "{{ $json.moved }}/{{ $json.file_count }} files"
                     " · {{ ($json.size_bytes / 1073741824).toFixed(2) }} GB\n"
-                    "Uploaded to Google Drive in {{ $json.duration_sec }}s",
+                    "Uploaded to Google Drive in {{ $json.duration_sec }}s"
+                    # Partial failures were previously invisible: jobs that
+                    # failed were filtered out and the run reported success
+                    # with a smaller file count and no explanation.
+                    "{{ $json.failed_count ? '\\n\\n\\u26a0\\ufe0f ' + $json.failed_count"
+                    " + ' upload(s) failed: ' + $json.failed_reason : '' }}",
             "additionalFields": {},
         }, tg, {"onError": "continueRegularOutput"}),
 
