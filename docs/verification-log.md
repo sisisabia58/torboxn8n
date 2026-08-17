@@ -566,3 +566,52 @@ The old instance's workflow was deactivated first, so the two never competed for
 the Telegram webhook.
 
 Only `scripts/watch_execution.py` carried a hardcoded workflow id, now updated.
+
+---
+
+## Execution 5 (new instance) — 150 MB of execution data from a 0.15 MB response
+
+A folder of 400+ files failed with `dataTooLargeToDisplay` and no retained run
+data. Sizes across three runs on the new host:
+
+```
+exec 3 (small)     0.0 MB   success
+exec 4 (253 files) 34.5 MB  success
+exec 5 (400+)     150.7 MB  error
+```
+
+Measuring exec 4 per node found a single dominant cause:
+
+| Node | MB | runs | items | share |
+| --- | --- | --- | --- | --- |
+| **Check Jobs** | **77.48** | 2 | 254 | **97.9%** |
+| All Jobs Done? | 0.30 | 2 | 2 | 0.4% |
+| This Run's Jobs | 0.30 | 2 | 2 | 0.4% |
+| everything else | <0.2 each | | | ~1% |
+
+### Cause: an HTTP node runs once per input item
+
+`Batch Files`' **done** output emits every item the loop processed — 253 of them.
+`Check Jobs` is an HTTP Request node, so it executed **253 times**, made 253
+identical API calls, and retained 253 full copies of the job list.
+
+The response itself is 0.15 MB. Retained 253 times it becomes 38 MB per run, and
+77 MB across two runs. At 400+ files it reached 150 MB and the execution died.
+
+Note this was never visible as an API problem: TorBox served 253 duplicate
+requests without complaint, and the workflow produced correct results at 253
+files. Only the memory ceiling exposed it.
+
+### Fix
+
+A `Poll Once` Code node (`runOnceForAllItems`, returns a single item) now sits
+between the loop's done output and `Check Jobs`, so the poll runs exactly once
+per cycle regardless of file count. Both entry points into the poll loop —
+`Batch Files` done and `Queue Zip` — route through it.
+
+Expected effect: ~500x less retained data for the polling phase, and 252 fewer
+API calls per cycle.
+
+**General rule:** before an HTTP node, check how many items reach it. Fan-in from
+a batch loop's done output is easy to miss and multiplies both traffic and memory
+by the item count.

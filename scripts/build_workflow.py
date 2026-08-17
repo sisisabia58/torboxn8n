@@ -494,6 +494,18 @@ def build(creds):
              None, {"webhookId": "a1b2c3d4-0000-4000-8000-000000000002"}),
 
         # --- Task 7: poll jobs, then correct Drive placement -----------------
+        # Collapses the batch loop's accumulated items to exactly one before
+        # polling. Batch Files' "done" output emits every item it processed, and
+        # an HTTP node runs once PER INPUT ITEM -- so a 253-file folder made 253
+        # identical calls and retained 253 copies of the full job list. That was
+        # 77.5 MB, 97.9% of the whole execution's data, from a 0.15 MB response.
+        # A 400-file folder reached 150 MB and died.
+        node("Poll Once", "n8n-nodes-base.code", 2, [2090, 160], {
+            "mode": "runOnceForAllItems",
+            "language": "javaScript",
+            "jsCode": "return [{ json: { poll: true } }];",
+        }),
+
         # One call returns every job for the hash, so polling cost is constant
         # whether the folder held 4 files or 400.
         node("Check Jobs", "n8n-nodes-base.httpRequest", 4.2, [2200, 160], {
@@ -1076,13 +1088,14 @@ def build(creds):
             [{"node": "Queue Zip", "type": "main", "index": 0}],     # true  -> zip
             [{"node": "Expand Files", "type": "main", "index": 0}],  # false -> per file
         ]},
-        "Queue Zip": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
+        "Queue Zip": {"main": [[{"node": "Poll Once", "type": "main", "index": 0}]]},
         "Expand Files": {"main": [[{"node": "Batch Files", "type": "main", "index": 0}]]},
         # splitInBatches outputs are ordered [done, loop]
         "Batch Files": {"main": [
-            [{"node": "Check Jobs", "type": "main", "index": 0}],
+            [{"node": "Poll Once", "type": "main", "index": 0}],
             [{"node": "Queue File", "type": "main", "index": 0}],
         ]},
+        "Poll Once": {"main": [[{"node": "Check Jobs", "type": "main", "index": 0}]]},
         "Queue File": {"main": [
             [{"node": "Throttle", "type": "main", "index": 0}],
             [{"node": "Rate Limited?", "type": "main", "index": 0}],  # error output
