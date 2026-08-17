@@ -155,3 +155,58 @@ queueing. Zip is now reserved for genuinely huge folders.
 
 The poll loop still has no stall guard (Task 9). If `files[]` never populates,
 the loop runs until n8n's execution timeout rather than reporting a failure.
+
+---
+
+## Execution 12 — the upload path works; progress reporting killed the run
+
+With the `files[]` gate fixed and the download cached, this run reached every
+remaining node.
+
+**Verified independently against the Drive API, not from execution status:**
+
+| Check | Result |
+| --- | --- |
+| Files from this run in the target folder | 72 / 72 |
+| Correctly parented (not orphaned) | 72 / 72 |
+| Renamed to clean basenames | 72 / 72 |
+
+So the Drive fix-up — search, rename, move — works. It had been my predicted
+failure point; that prediction was wrong.
+
+### But the execution reported `error`
+
+```
+Progress: Upload
+Bad Request: message is not modified: specified new message content and
+reply markup are exactly the same as a current content
+```
+
+Telegram refuses an edit whose text is byte-identical to the current message.
+With 72 files, two consecutive polls rendered the same completed-count and the
+same rounded percentage, so the edit was a no-op and returned HTTP 400.
+
+**A cosmetic progress update aborted a transfer that had already fully
+succeeded.** Files were in place; the run still ended in error and never
+reported completion.
+
+**Fix, two layers:**
+- Every progress message now ends with `updated HH:mm:ss`, so no two edits are
+  ever identical.
+- Both progress nodes carry `onError: continueRegularOutput`. Display failures
+  must not be able to abort the pipeline.
+
+### Basename collisions
+
+Three files named `Read me.txt` arrived from different subfolders of the same
+Mega folder. Renaming to `split('/').pop()` collapses distinct paths into
+identical names in one flat Drive folder. Drive permits duplicates so nothing
+failed, but the files are no longer distinguishable. Worth prefixing with the
+parent segment if this matters.
+
+### Note on counting
+
+The folder listed 75 files, not 72. Three were leftovers from earlier manual
+probing, with the old flattened names. Checking `createdTime` separated them
+cleanly — raw counts alone would have misread this as the workflow duplicating
+work.

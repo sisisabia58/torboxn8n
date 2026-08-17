@@ -246,9 +246,14 @@ def build(creds):
                     "{{ ($('Check Download').item.json.data.progress * 100).toFixed(1) }}%\n"
                     "{{ $runIndex < 1 ? 'measuring speed...' : "
                     "($('Check Download').item.json.data.download_speed / 1048576).toFixed(1) "
-                    "+ ' MB/s' }}",
+                    "+ ' MB/s' }}\n"
+                    # Telegram rejects an edit whose text is byte-identical to
+                    # the current message ("message is not modified", HTTP 400).
+                    # Two consecutive polls can easily render the same string,
+                    # so a changing timestamp keeps every edit distinct.
+                    "updated {{ $now.toFormat('HH:mm:ss') }}",
             "additionalFields": {},
-        }, tg),
+        }, tg, {"onError": "continueRegularOutput"}),
 
         node("Wait 30s", "n8n-nodes-base.wait", 1.1, [660, 380],
              {"resume": "timeInterval", "amount": 30, "unit": "seconds"},
@@ -392,9 +397,14 @@ def build(creds):
                     "{{ $json.data.filter(j => j.status === 'completed').length }}"
                     "/{{ $json.data.length }} files\n"
                     "{{ Math.round($json.data.reduce((a, j) => a + (j.progress || 0), 0)"
-                    " / $json.data.length * 100) }}%",
+                    " / $json.data.length * 100) }}%\n"
+                    "updated {{ $now.toFormat('HH:mm:ss') }}",
             "additionalFields": {},
-        }, tg),
+        # onError keeps a cosmetic edit failure from aborting a transfer that is
+        # otherwise succeeding. Execution 12 uploaded all 72 files correctly and
+        # then died here, reporting error, because two polls rendered the same
+        # text and Telegram refused the duplicate edit.
+        }, tg, {"onError": "continueRegularOutput"}),
 
         node("Wait Jobs 20s", "n8n-nodes-base.wait", 1.1, [2200, 400],
              {"resume": "timeInterval", "amount": 20, "unit": "seconds"},
