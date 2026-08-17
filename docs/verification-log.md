@@ -108,3 +108,50 @@ download run.
 Note that setting `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` exposes every
 environment variable — including `N8N_ENCRYPTION_KEY` — to every workflow on
 the instance.
+
+---
+
+## Tasks 5-7, first execution (exec 11)
+
+Reached `Mint Token` and beyond for the first time.
+
+Worked: `Mint Token` returned a real 253-char token with `scope=drive`, proving
+`$env` resolves in the live pipeline. `Many Files?` evaluated and branched.
+
+### Bug: TorBox sets download_finished before populating files[]
+
+The run ended at `Expand Files` having emitted zero items, and reported
+**success**. Polls showed:
+
+```
+run3: finished=False progress=0.94  files=0
+run4: finished=True  progress=1     files=0
+```
+
+Queried directly a few minutes later, the same download had **72 files**.
+
+So `download_finished` flips before `files[]` is filled. Gating on the flag
+alone let the workflow proceed with an empty list: `Expand Files` mapped over
+`[]`, emitted nothing, downstream nodes never ran, and the execution finished
+green with nothing uploaded.
+
+This also silently corrupted the fan-out decision — `Many Files?` compared
+`0 > 30` and chose per-file for what is really a 72-file folder.
+
+**Fix:** `Download Done?` now requires `download_finished === true` AND
+`files.length > 0`.
+
+**Note:** a green execution is not evidence of a completed transfer. This one
+did nothing at all and looked identical to success.
+
+### Threshold raised 30 -> 150
+
+30 was set before any real folder was measured. At 30, a routine 72-file folder
+would collapse into a single 3 GB zip, making its videos unstreamable in Drive.
+Batching submits ~200 req/min against a 300/min ceiling, so 150 files is ~45s of
+queueing. Zip is now reserved for genuinely huge folders.
+
+### Open risk
+
+The poll loop still has no stall guard (Task 9). If `files[]` never populates,
+the loop runs until n8n's execution timeout rather than reporting a failure.

@@ -32,7 +32,12 @@ DRIVE_FOLDER_ID = "1ERCHFMwp1jPVgFQPM4VPN4mlObA2pzwI"
 
 # Above this many files, upload one zip instead of one job per file, to stay
 # clear of TorBox's 300 requests/min limit.
-FILE_COUNT_THRESHOLD = 30
+#
+# Batching submits ~200 requests/min, so 150 files is roughly 45s of queueing --
+# comfortably under the ceiling. Set low (30) at first, which would have turned
+# a real 72-file folder into a single 3 GB zip and made its videos unstreamable.
+# Zip is for genuinely huge folders, not ordinary ones.
+FILE_COUNT_THRESHOLD = 150
 
 # Credentials required, by n8n credential type -> credential NAME on the instance.
 # torBoxApi is intentionally absent: the workflow no longer uses the community
@@ -204,13 +209,28 @@ def build(creds):
                 "combinator": "and",
                 "options": {"caseSensitive": True, "leftValue": "",
                             "typeValidation": "strict", "version": 2},
-                "conditions": [{
-                    "id": "dl-finished",
-                    "leftValue": "={{ $json.data.download_finished }}",
-                    "rightValue": "",
-                    "operator": {"type": "boolean", "operation": "true",
-                                 "singleValue": True},
-                }],
+                # Both conditions are required. TorBox flips download_finished
+                # BEFORE it populates files[], so gating on the flag alone lets
+                # the run continue with an empty file list: Expand Files then
+                # emits nothing, the upload never happens, and the execution
+                # still reports success. Observed on execution 11, where the
+                # final poll saw finished=true files=0 for a download that
+                # actually contained 72 files.
+                "conditions": [
+                    {
+                        "id": "dl-finished",
+                        "leftValue": "={{ $json.data.download_finished }}",
+                        "rightValue": "",
+                        "operator": {"type": "boolean", "operation": "true",
+                                     "singleValue": True},
+                    },
+                    {
+                        "id": "files-populated",
+                        "leftValue": "={{ ($json.data.files || []).length }}",
+                        "rightValue": 0,
+                        "operator": {"type": "number", "operation": "gt"},
+                    },
+                ],
             },
             "looseTypeValidation": False,
             "options": {},
