@@ -165,7 +165,19 @@ In **Testing** mode Google expires refresh tokens after 7 days and the workflow
 dies weekly. This affects both the minted upload token and n8n's own Drive
 credential.
 
-### 6.3 TorBox plan expiry
+### 6.3 Memory ceiling on the host
+Executions 27-29 failed on a 253-file folder in three different ways: a Google
+Drive rate limit (a real defect, fixed), a process crash, and an out-of-memory
+kill. The job payload was measured at 0.15 MB, so this was the container's
+ceiling rather than workflow waste.
+
+An OOM also destroys the run data that would explain it, so the failure is
+self-obscuring. Worth setting `NODE_OPTIONS=--max-old-space-size` below the
+container limit so Node collects garbage before the platform kills it, and
+`EXECUTIONS_DATA_SAVE_ON_SUCCESS=none` to stop retaining full payloads for runs
+that worked.
+
+### 6.4 TorBox plan expiry
 Web downloads are paid-only. When the plan lapses the failure looks like a
 permissions error, not a billing one. Cheap to detect: `GET /user/me` exposes
 `premium_expires_at`.

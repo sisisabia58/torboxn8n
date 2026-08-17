@@ -487,3 +487,57 @@ first thing to check.
 `Account OK?` returned `ok: true, plan: 1, cooldown_hours: 23.9` — confirming the
 corrected pre-flight lets a healthy paid account through while still reporting
 the cooldown value for information.
+
+---
+
+## Execution 29 — out of memory, and why the instance is being replaced
+
+```
+status: crashed        last node: Check Jobs
+error : "Node crashed, possible out-of-memory issue"
+```
+
+Almost no run data survived — the crash took it with it, which is itself a
+diagnostic problem: an OOM erases the evidence of what consumed the memory.
+
+### It is not payload volume
+
+Measured directly rather than assumed. `GET /integration/jobs/{hash}` for the
+253-file folder returns:
+
+```
+254 jobs · 0.15 MB · ~601 bytes per job
+```
+
+That is small, and it does not grow fast enough across polls to explain an OOM.
+The conclusion is that the container's memory ceiling was simply low relative to
+n8n's baseline plus a 253-item execution — not that the workflow is wasteful.
+
+Note the job list is scoped per hash and had reached 254 entries for a folder of
+253 files, i.e. it accumulates across runs of the same link. That matters for
+roadmap 1.1, but it is not the OOM cause at this size.
+
+### Consequence
+
+Executions 27, 28 and 29 all failed at or after the upload phase on a 253-file
+folder, in three different ways — Google rate limit, process crash, OOM. Only
+the first was a workflow defect. The instance is being migrated to a Railway
+account with more memory and CPU rather than tuning the workflow further against
+a ceiling it cannot see.
+
+## Migration to a new n8n instance (in progress)
+
+- Old: `https://n8n-production-2890c.up.railway.app` — workflow **deactivated**
+  before migrating, so the two instances never contend for the Telegram webhook
+  (Telegram permits one webhook per bot token).
+- New: `https://n8n-production-564b.up.railway.app` — reachable, `/healthz` 200.
+
+The workflow needs no export. `scripts/build_workflow.py --deploy` reconstructs
+all 53 nodes against any instance and resolves credentials **by name**, which is
+precisely why no credential IDs have to be copied by hand. Execution history does
+not carry over and is not needed.
+
+Highest-risk item on the new host is `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`. If it
+is missed, `Mint Token` fails with `invalid_client`, which points at Google
+rather than at the real cause. `scripts/check_env_access.py` settles it in
+seconds.
