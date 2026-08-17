@@ -250,3 +250,36 @@ still need to surface somewhere.
 Telegram node emits the Telegram API response rather than passing its input
 through. Any node reading `$input` after it gets the wrong payload. Downstream
 Code nodes now address their source node by name instead.
+
+---
+
+## Execution 18 — full pipeline verified end to end
+
+A different and larger source folder than earlier tests.
+
+```
+Write Build Scale - Substack System
+123 files · 3.45 GB · 88 seconds · 0 failures
+```
+
+Every node ran, from `Telegram Trigger` through `Done` and `Log Success`:
+
+- Completion message succeeded: `{"ok": true, "message_id": 30}` — a real
+  success, not an error silenced by `onError`, which is how the same node
+  presented on execution 17.
+- Sheet row written: `success | complete | 123 | 3447422669`.
+- Drive tree correct: 11 sections, 123 files, **0** loose files at the root,
+  **0** filenames still containing a path separator.
+
+Both previously transferred folders remain correctly structured side by side,
+so a second transfer does not disturb the first.
+
+**Task 8 verified.** Tasks 1–8 are now confirmed against live services.
+
+### Still unexercised
+
+- The failure path (`Classify Failure` → `Report Failure` → `Log Failure`) has
+  never run. It is deployed but unproven.
+- Neither loop timeout guard has ever tripped.
+- The zip branch has never executed — this folder was 123 files against a
+  threshold of 150.
