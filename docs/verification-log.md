@@ -399,3 +399,45 @@ check that knows why it failed should report it this way rather than throwing.
 
 **General rule:** avoid colons in thrown n8n error messages, and prefer a
 structured verdict over an exception wherever the caller can route on it.
+
+---
+
+## Execution 26 — 401, and a false-positive pre-flight
+
+Two problems, one of them self-inflicted.
+
+### 401 from a valid key
+
+`Check Account` returned `401 {"detail":"Not authenticated"}` even though the
+same key worked from curl. The `TorBox Bearer` credential is a Header Auth whose
+value must be the word `Bearer`, a space, then the key. Pasting the bare key
+yields `Authorization: <key>` and exactly this 401.
+
+Now classified as `torbox-auth`, with a reason that names the credential and the
+prefix, so the next occurrence is self-diagnosing.
+
+**Operational note:** editing that credential in place preserves its ID and needs
+no redeploy. Deleting and recreating it changes the ID, and all six nodes that
+use it must be repointed — `build_workflow.py --deploy` does that automatically
+by resolving credentials by name.
+
+### cooldown_until is not an enforcement flag
+
+The pre-flight added after execution 23 blocked when `cooldown_until` was in the
+future. That was inferred from a single account and is **wrong**:
+
+| Account | `cooldown_until` | Uploads |
+| --- | --- | --- |
+| 969506 (24h trial) | ~24h out | all 253 failed |
+| 234926 (paid, 73 downloads) | ~24h out | working |
+
+Both show the field set the same distance ahead; only one is actually blocked. It
+behaves like a rolling timestamp, not a block. Gating on it would have rejected a
+perfectly healthy paid account.
+
+The check now blocks **only** on expired premium, which is unambiguous, and
+carries `cooldown_hours` through as information.
+
+**Lesson:** one account's correlation is not a mechanism. The trial's uploads
+probably failed for a plan-tier reason that happened to coexist with a cooldown
+timestamp.
