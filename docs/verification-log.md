@@ -541,3 +541,28 @@ Highest-risk item on the new host is `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`. If it
 is missed, `Mint Token` fails with `invalid_client`, which points at Google
 rather than at the real cause. `scripts/check_env_access.py` settles it in
 seconds.
+
+### Migration complete
+
+New instance `https://n8n-production-564b.up.railway.app`, workflow id
+`kT5wpQZKNhEX8qsM`, 53 nodes, active.
+
+Verified before and after deploying, in this order:
+
+| Check | Result |
+| --- | --- |
+| API reachable, key accepted | OK, 0 workflows (clean host) |
+| Credentials by exact name | 4/4 present |
+| `$env` in Code node and expression | readable, lengths 72/35/102 — same client |
+| Deployed graph | 53 nodes, no dangling connections |
+| Community node types | none |
+| Activation | succeeded |
+
+Nothing was exported or hand-copied. `build_workflow.py --deploy` rebuilt the
+workflow from source and resolved credentials by name, which is why a host move
+costs one command rather than a JSON import plus manual credential repointing.
+
+The old instance's workflow was deactivated first, so the two never competed for
+the Telegram webhook.
+
+Only `scripts/watch_execution.py` carried a hardcoded workflow id, now updated.

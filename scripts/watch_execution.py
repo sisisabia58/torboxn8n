@@ -15,7 +15,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_workflow import api  # noqa: E402
 
-WID = sys.argv[1] if len(sys.argv) > 1 else "lXx9PnCwig2H2sQV"
+# Default workflow id on the current n8n instance. Changes whenever the
+# workflow is deployed to a different host -- build_workflow.py finds it by
+# NAME, so only this convenience default needs updating.
+WID = sys.argv[1] if len(sys.argv) > 1 else "kT5wpQZKNhEX8qsM"
 INTERVAL = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 MAX = int(sys.argv[3]) if len(sys.argv) > 3 else 60
 
